@@ -14,6 +14,7 @@ import base64
 import json
 import os
 import textwrap
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -194,13 +195,44 @@ def fetch_fear_greed() -> dict:
         return {"value": 50, "classification": "Neutral"}
 
 
-@st.cache_data(ttl=120)
-def fetch_headlines() -> list:
-    try:
-        from news_fetcher import fetch_all_headlines
-        return fetch_all_headlines(max_age_hours=3, max_total=25)
-    except Exception:
-        return []
+class _NewsCache:
+    def __init__(self):
+        self._headlines: list = []
+        self._lock = threading.Lock()
+
+    def set(self, headlines: list):
+        with self._lock:
+            self._headlines = headlines
+
+    def get(self) -> list:
+        with self._lock:
+            return list(self._headlines)
+
+
+@st.cache_resource
+def _start_news_background_thread() -> _NewsCache:
+    """
+    Starts a single background thread that fetches news every 5 minutes.
+    st.cache_resource ensures this runs exactly once regardless of how many
+    times Streamlit reruns the script — the thread and cache persist forever.
+    """
+    cache = _NewsCache()
+
+    def _worker():
+        while True:
+            try:
+                from news_fetcher import fetch_all_headlines
+                cache.set(fetch_all_headlines(max_age_hours=3, max_total=25))
+            except Exception:
+                pass
+            time.sleep(300)  # refresh every 5 minutes
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    return cache
+
+
+_news_cache = _start_news_background_thread()
 
 
 @st.cache_data(ttl=300)  # LLM estimate cached 5 minutes
@@ -416,7 +448,7 @@ with st.spinner(""):
     ticker        = fetch_btc_ticker()
     kalshi_mkts   = fetch_kalshi_markets()
     fng           = fetch_fear_greed()
-    headlines     = fetch_headlines()
+    headlines     = _news_cache.get()
     trader_state  = load_trader_state()
 
 if df_ohlcv.empty:

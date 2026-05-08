@@ -460,11 +460,12 @@ def generate_short_term_signal(ind: dict) -> dict:
         "direction":  direction,
         "strength":   strength,
         "bull_score": score,
-        "rsi":        rsi,
-        "macd":       macd,
-        "macd_hist":  ind["macd_hist"],
-        "atr_pct":    ind["atr_pct"],
-        "timeframe":  ind.get("timeframe", "?"),
+        "rsi":         rsi,
+        "macd":        macd,
+        "macd_signal": macd_sig,
+        "macd_hist":   ind["macd_hist"],
+        "atr_pct":     ind["atr_pct"],
+        "timeframe":   ind.get("timeframe", "?"),
     }
 
 
