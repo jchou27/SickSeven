@@ -572,6 +572,50 @@ with macro_col:
         unsafe_allow_html=True,
     )
 
+    # Trump tweet signal
+    st.subheader("Trump Signal")
+    try:
+        from trump_watcher import get_trump_signal
+        trump_sig = get_trump_signal(max_age_minutes=60)
+    except Exception:
+        trump_sig = None
+
+    if trump_sig:
+        imp     = trump_sig.get("impact", "neutral")
+        urgency = trump_sig.get("urgency", "low")
+        adj     = trump_sig.get("probability_adjustment", 0.0)
+        ts_raw  = trump_sig.get("timestamp", "")
+        try:
+            ts_dt  = datetime.fromisoformat(ts_raw)
+            age_m  = (datetime.now(timezone.utc) - ts_dt.replace(tzinfo=timezone.utc if ts_dt.tzinfo is None else ts_dt.tzinfo)).total_seconds() / 60
+            age_str = f"{age_m:.0f}m ago"
+        except Exception:
+            age_str = ""
+
+        imp_color = (
+            "#00C853" if imp in ("btc_bullish", "usd_bearish") else
+            "#D50000" if imp in ("btc_bearish", "usd_bullish") else
+            "#FFD600"
+        )
+        urgency_color = {"high": "#D50000", "medium": "#FFD600", "low": "#aaa"}.get(urgency, "#aaa")
+        st.markdown(
+            f"<div style='padding:10px;border-radius:8px;border:1px solid {imp_color};"
+            f"background:{imp_color}18;margin-bottom:8px'>"
+            f"<div style='display:flex;justify-content:space-between;margin-bottom:4px'>"
+            f"<span style='font-weight:700;color:{imp_color};font-size:0.85em'>{imp.replace('_',' ').upper()}</span>"
+            f"<span style='color:{urgency_color};font-size:0.75em'>{urgency.upper()} · {age_str}</span>"
+            f"</div>"
+            f"<div style='font-size:0.8em;color:#ccc'>{trump_sig.get('reasoning','')}</div>"
+            f"<div style='font-size:0.75em;color:#888;margin-top:4px;font-style:italic'>"
+            f"\"{trump_sig.get('tweet_text','')[:120]}...\"</div>"
+            f"<div style='font-size:0.85em;color:{imp_color};margin-top:4px'>"
+            f"Prob adj: {adj:+.0%}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("No recent Trump signal (watcher not running or no new tweets)")
+
     # Trader daemon status
     st.subheader("Trader Daemon")
     is_running = trader_state.get("is_running", False)

@@ -1,11 +1,12 @@
 """
 LLM-based Bitcoin directional probability model.
 
-Combines four data streams:
+Combines five data streams:
   1. Technical indicators (RSI, MACD, Bollinger, MAs)   from strategy.py
   2. Multi-source BTC news headlines                     from news_fetcher.py
   3. Kalshi prediction-market implied odds               from kalshi_client.py
   4. Macro sentiment (Fear & Greed, BTC dominance)       from free public APIs
+  5. Trump tweet signal                                  from trump_watcher.py (if running)
 
 Returns a blended probability (0.0–1.0) that BTC will be higher in ~4 hours,
 combining the technical score and the LLM's contextual assessment.
@@ -348,6 +349,23 @@ def get_combined_probability(
         llm_error     = str(e)
         label, direction, strength = probability_to_signal(tech_prob)
 
+    # Trump tweet adjustment — applied on top of the blended estimate.
+    # trump_watcher.py must be running separately; if not, this is a silent no-op.
+    trump_signal: Optional[dict] = None
+    try:
+        from trump_watcher import get_trump_signal
+        trump_signal = get_trump_signal(max_age_minutes=30)
+        if trump_signal:
+            adj = float(trump_signal.get("probability_adjustment", 0.0))
+            combined_prob = round(max(0.05, min(0.95, combined_prob + adj)), 4)
+            label, direction, strength = probability_to_signal(combined_prob)
+            log.info(
+                f"Trump signal applied: {trump_signal['impact']} adj={adj:+.2f} "
+                f"-> combined_prob={combined_prob:.2%}"
+            )
+    except Exception:
+        pass
+
     return {
         "timestamp":         now,
         "tech_prob":         tech_prob,
@@ -365,4 +383,5 @@ def get_combined_probability(
         "recent_headlines":  raw_headlines[:10],
         "llm_detail":        llm_result,
         "llm_error":         llm_error,
+        "trump_signal":      trump_signal,
     }

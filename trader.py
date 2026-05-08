@@ -44,8 +44,8 @@ DEFAULT_CONFIG: dict = {
     "enabled":            False,   # master switch — must be True to place real orders
     "dry_run":            True,    # log orders but never actually send them
     "series_ticker":      "KXBTCD",
-    "max_contracts":      5,
-    "max_open_risk_usd":  50.0,    # refuse new orders when total open cost exceeds this
+    "max_contracts":      2,       # conservative: ~$1 per trade at 50c/contract
+    "max_open_risk_usd":  5.0,     # hard cap on total open exposure in USD
     "stop_loss_pct":      0.40,    # close a position when its loss exceeds 40% of cost
     "only_on_change":     True,    # skip order if signal label hasn't changed
     "cooldown_minutes":   15,      # minimum minutes between consecutive orders
