@@ -1,8 +1,27 @@
-# BTC / Kalshi Automated Trading System
+# SickSeven — BTC / Kalshi Automated Trading System
 
-A real-time Bitcoin dashboard and autonomous trading engine that generates
-technical signals from CoinGecko market data and executes binary-option orders
-on Kalshi.
+A real-time Bitcoin analysis and autonomous trading engine. Generates directional
+signals from technical indicators, an LLM probability model, and live news, then
+executes binary-option orders on Kalshi.
+
+---
+
+## What it does
+
+**Long-term strategy (trader daemon)**
+Runs every 60 seconds. Pulls 30 days of hourly BTC prices from CoinGecko, scores
+5 technical factors (RSI, MACD, MA crossover, EMA200 trend, Bollinger Bands), and
+places Kalshi binary-option orders when there is a clear directional edge.
+
+**Short-term monitor (1m / 5m / 15m)**
+A separate Streamlit dashboard with live Kraken candlestick charts, short-term
+indicators (VWAP, fast/slow EMA cross), and a real-time signal badge. Refreshes
+every 15 seconds.
+
+**LLM probability model**
+Uses the Claude API (claude-sonnet-4-6) to blend the technical signal with live BTC
+news headlines, Fear & Greed Index, and BTC dominance into a 0–100% probability
+estimate. Displayed as a gauge on the short-term monitor.
 
 ---
 
@@ -10,15 +29,21 @@ on Kalshi.
 
 ```
 sickseven/
-├── .env                  # API keys and secrets (never commit this)
-├── requirements.txt      # Python dependencies
-├── kalshi_client.py      # Kalshi API wrapper
-├── strategy.py           # Indicators, signal engine, order logic
-├── trader.py             # Autonomous trading daemon
-├── dashboard.py          # Streamlit live dashboard
-├── trading_config.json   # Runtime config (auto-created on first run)
-├── trading_state.json    # Live state written by trader daemon
-└── trader.log            # Rolling log of all trader activity
+├── .env                    # API keys and secrets (never commit)
+├── requirements.txt        # Python dependencies
+│
+├── strategy.py             # All indicator + signal + sizing logic (long + short term)
+├── kalshi_client.py        # Kalshi API v2 wrapper (RSA auth + retry)
+├── news_fetcher.py         # BTC news aggregator (8 RSS feeds + 3 Reddit, no keys)
+├── probability_model.py    # LLM probability model (Claude API)
+│
+├── trader.py               # Autonomous trading daemon
+├── dashboard.py            # Long-term trading control UI (port 8501)
+├── monitor.py              # Short-term market monitor (port 8502)
+│
+├── trading_config.json     # Runtime config (auto-created on first run)
+├── trading_state.json      # Live state written by daemon, read by dashboards
+└── trader.log              # Rolling log of every trader cycle
 ```
 
 ---
@@ -30,189 +55,107 @@ Holds all secrets. Never share or commit this file.
 
 | Variable | What it is |
 |---|---|
-| `GECKO_API` | CoinGecko demo API key for price data |
-| `KALSHI_API_KEY` | Your Kalshi key UUID (the "who you are") |
+| `GECKO_API` | CoinGecko demo API key for 30-day hourly price history |
+| `KALSHI_API_KEY` | Your Kalshi key UUID (identifies who you are) |
 | `KALSHI_PRIV` | RSA private key used to sign every Kalshi request |
+| `ANTHROPIC_API_KEY` | Claude API key for the LLM probability model |
 
 Kalshi uses RSA signature authentication — every API request is signed with
-your private key, not a simple bearer token. The `KALSHI_API_KEY` identifies
-you and `KALSHI_PRIV` proves it.
-
----
-
-### `kalshi_client.py`
-Low-level Kalshi API v2 wrapper. All other files import from here.
-
-**What it does:**
-- Loads and reconstructs your RSA private key from `.env`
-- Signs every outbound request (timestamp + method + path → SHA256/PKCS1v15)
-- Exposes clean functions for every API action you need
-
-**Key functions:**
-
-| Function | Description |
-|---|---|
-| `get_balance()` | Returns your Kalshi account balance in cents |
-| `get_markets(series_ticker)` | Lists open markets for a given series (e.g. `KXBTCD`) |
-| `search_markets(keyword)` | Fallback keyword search across all open markets |
-| `get_positions()` | Your current open positions |
-| `get_orders(status)` | Resting, filled, or cancelled orders |
-| `place_order(...)` | Place a limit or market order |
-| `cancel_order(order_id)` | Cancel a single resting order |
-| `cancel_all_resting()` | Emergency: cancel every open order |
-
-You generally do not call this file directly — `trader.py` uses it.
+your private key, not a simple bearer token.
 
 ---
 
 ### `strategy.py`
-All trading logic lives here. No API calls, no I/O — pure computation.
+All trading logic in one place. No API calls, no I/O — pure computation.
+Everything else imports from here; never duplicate indicator logic in other files.
 
-**What it does:**
+**Long-term signal (5 factors, ±7 max score):**
 
-**1. Indicators** (`compute_indicators`)
-Takes a pandas Series of hourly closing prices and computes:
-- SMA 20 and SMA 50 (simple moving averages)
-- EMA 20 (exponential moving average)
-- RSI 14 (relative strength index)
-
-**2. Signal generation** (`generate_signal`)
-Scores each indicator for bullishness/bearishness:
-
-| Condition | Score |
-|---|---|
-| RSI < 30 (oversold) | +2 |
-| RSI < 40 | +1 |
-| RSI > 60 | −1 |
-| RSI > 70 (overbought) | −2 |
-| SMA20 > SMA50 (golden cross) | +1 |
-| SMA20 < SMA50 (death cross) | −1 |
-| Price > EMA20 | +1 |
-| Price < EMA20 | −1 |
-
-Total score maps to a signal:
-
-| Score | Signal | Direction |
+| Factor | Bullish | Bearish |
 |---|---|---|
-| ≥ 3 | STRONG BUY | up |
-| 1–2 | BUY | up |
-| 0 | HOLD | neutral |
-| −1 to −2 | SELL | down |
-| ≤ −3 | STRONG SELL | down |
+| RSI (±2) | RSI < 30 → +2, RSI < 40 → +1 | RSI > 70 → -2, RSI > 60 → -1 |
+| MACD (±2) | Line > signal +1, line > 0 +1 | Line < signal -1, line < 0 -1 |
+| MA crossover (±1) | SMA20 > SMA50 | SMA20 < SMA50 |
+| EMA200 trend (±1) | Price > EMA200 | Price < EMA200 |
+| Bollinger %B (±1) | %B ≤ 0.05 (at lower band) | %B ≥ 0.95 (at upper band) |
 
-**3. Market selection** (`select_market`)
-Given a direction (up/down) and a list of Kalshi markets, picks the best one:
-- Filters for markets where the relevant-side ask is between 15–85 cents
-  (avoids near-certain or near-impossible contracts)
-- Ranks by volume × proximity to 50 cents (most liquid, most informative)
+Score → signal: ≥4 = STRONG BUY, 2–3 = BUY, -1–1 = HOLD, -2–-3 = SELL, ≤-4 = STRONG SELL
 
-**4. Order sizing** (`compute_order`)
-Converts a signal + market into order parameters:
-- STRONG signal → 100% of `max_contracts`
-- Regular signal → 50% of `max_contracts`
-- Sets a limit price 1 cent above the current ask to ensure a quick fill
+**Short-term signal (1m / 5m / 15m):** Same RSI and MACD factors, but replaces the
+SMA/EMA200 trend filters with a fast/slow EMA cross (±1) and VWAP comparison (±1).
+Indicator periods adapt to the selected timeframe.
+
+**Position sizing:** ATR-based volatility scaling. At 2× normal volatility, position
+size halves to keep dollar risk roughly constant.
+
+---
+
+### `kalshi_client.py`
+Low-level Kalshi API v2 wrapper. Every request is RSA-signed with a fresh
+timestamp. Includes 3-attempt exponential backoff retry (4xx errors are not retried).
+
+Key functions: `get_balance`, `get_markets`, `get_positions`, `get_orders`,
+`place_order`, `close_position` (for stop-loss), `cancel_all_resting` (emergency).
+
+---
+
+### `news_fetcher.py`
+Aggregates BTC headlines from 11 free sources with no API keys required:
+- **8 RSS feeds**: CoinDesk, CoinTelegraph, Bitcoin Magazine, Decrypt, Bitcoinist,
+  NewsBTC, CryptoNews, BeInCrypto
+- **3 Reddit JSON feeds**: r/Bitcoin, r/CryptoCurrency (BTC-filtered), r/btc
+
+Fetches all sources in parallel, deduplicates by title, and returns headlines
+sorted newest-first with age in minutes.
+
+---
+
+### `probability_model.py`
+Calls the Claude API to estimate the probability BTC moves up over the next ~4 hours.
+Inputs: current technical indicators, live news headlines, Fear & Greed Index,
+BTC dominance, and total crypto market cap change.
+
+The final probability is a 50/50 blend of the technical score and the LLM estimate.
+Falls back to technical-only if the Claude API is unavailable.
 
 ---
 
 ### `trader.py`
-The autonomous trading daemon. Run this in a separate terminal and leave it
-running. It operates completely independently of the dashboard.
+The autonomous daemon. Run it in a terminal and leave it running.
 
-**What it does each cycle (every 60 seconds by default):**
-
-1. Fetches 30 days of hourly BTC price history from CoinGecko
-2. Computes indicators and generates a signal via `strategy.py`
-3. Refreshes your Kalshi portfolio (balance + open positions)
-4. Checks all guard rails (trading enabled? signal changed? risk limit OK?)
-5. Selects the best Kalshi BTC market and sizes the order
-6. Places the order (or logs it if dry run is on)
-7. Writes everything to `trading_state.json` for the dashboard
-
-**Guard rails (in order):**
-- `enabled: false` → no orders placed (default)
-- `dry_run: true` → signals logged, no real orders sent (default)
-- Signal unchanged + `only_on_change: true` → skip (avoids spamming)
-- HOLD signal → skip (no trade when there is no edge)
-- Open risk ≥ `max_open_risk_usd` → skip (position size hard cap)
-
-**Config changes take effect on the next cycle** — you never need to restart
-the daemon.
+Each cycle (every 60s by default):
+1. Fetch 30 days of hourly BTC prices from CoinGecko
+2. Compute indicators and generate a signal
+3. Refresh Kalshi portfolio (balance + open positions)
+4. Run stop-loss checks — close any position down more than `stop_loss_pct`
+5. Check all guard rails (enabled? cooldown? risk limit? signal changed?)
+6. Select the best Kalshi BTC market and size the order
+7. Place the order (or log it in dry-run mode)
+8. Write everything to `trading_state.json`
 
 ---
 
 ### `dashboard.py`
-The Streamlit web UI. Auto-refreshes every 30 seconds.
+Long-term trading control UI. Auto-refreshes every 30 seconds.
 
-**Sections:**
-
-**Top row — live metrics**
-- BTC price and 24-hour change
-- 24-hour trading volume
-- Current RSI value and zone (Neutral / Overbought / Oversold)
-- Strategy signal badge (color-coded STRONG BUY → STRONG SELL)
-- Best open Kalshi BTC market yes-price
-
-**Price chart**
-- 7-day OHLC candlesticks
-- SMA 20 (orange), SMA 50 (blue), EMA 20 (purple dashed)
-- RSI subplot with overbought (red) and oversold (green) zones
-
-**Kalshi Markets table**
-- All open BTC markets with yes/no ask prices, volume, and expiry
-
-**Automated Trading section**
-- Status banner: shows whether the daemon is running, and whether trading
-  is live or in dry-run mode
-- Portfolio snapshot: balance, open position count, unrealized P&L
-- Open positions table
-- Recent orders table (last 20)
-- Error log from the most recent trader cycle
-
-**Trading Configuration form**
-- Toggle dry run / enable live trading
-- Set max contracts per trade, max open risk in USD
-- Set the Kalshi series ticker and cycle interval
-- Changes are saved to `trading_config.json` immediately
+- 7-day OHLC candlestick chart with Bollinger Bands, SMA20/50, EMA20, EMA200,
+  RSI subplot, and MACD subplot
+- Live Kalshi market odds table
+- Portfolio snapshot: balance, open positions, unrealized P&L
+- Trading configuration form (enable/disable, risk limits, stop-loss, cooldown)
 
 ---
 
-### `trading_config.json`
-Created automatically on the first run of `trader.py`. Edit it directly or
-use the dashboard config form.
+### `monitor.py`
+Short-term market monitor. Auto-refreshes every 15 seconds.
 
-```json
-{
-  "enabled":           false,
-  "dry_run":           true,
-  "series_ticker":     "KXBTCD",
-  "max_contracts":     5,
-  "max_open_risk_usd": 50.0,
-  "only_on_change":    true,
-  "loop_interval_sec": 60
-}
-```
-
-| Field | Description |
-|---|---|
-| `enabled` | Master switch — must be `true` to place real orders |
-| `dry_run` | Log signals only, no real orders. Overrides `enabled`. |
-| `series_ticker` | Kalshi market series to trade (`KXBTCD` = daily BTC) |
-| `max_contracts` | Max contracts placed per signal (strong signal uses 100%, regular uses 50%) |
-| `max_open_risk_usd` | Stop placing orders when total open exposure exceeds this dollar amount |
-| `only_on_change` | Only trade when the signal changes (prevents repeated orders on the same signal) |
-| `loop_interval_sec` | How often the trader daemon runs, in seconds |
-
----
-
-### `trading_state.json`
-Written by `trader.py` at the end of every cycle. The dashboard reads this
-file on every refresh. You can inspect it directly to debug the trader.
-
----
-
-### `trader.log`
-A plain-text log of every trader cycle: signals, decisions, orders placed,
-errors. Check this first when something goes wrong.
+- 1m / 5m / 15m Kraken candlestick charts with EMAs, VWAP, Bollinger Bands,
+  RSI, and MACD
+- Short-term technical signal badge (BUY / SELL / HOLD + score)
+- LLM probability gauge (Claude API estimate, refreshes every 5 minutes)
+- Live BTC news feed (last 3 hours, up to 20 headlines)
+- Fear & Greed Index + BTC dominance snapshot
+- Kalshi market odds
 
 ---
 
@@ -223,64 +166,66 @@ errors. Check this first when something goes wrong.
 pip install -r requirements.txt
 ```
 
-**2. Verify your `.env`**
-Make sure `GECKO_API`, `KALSHI_API_KEY`, and `KALSHI_PRIV` are all set.
+**2. Configure `.env`**
+```
+GECKO_API         = your_coingecko_demo_key
+KALSHI_API_KEY    = your_kalshi_uuid
+KALSHI_PRIV       = 'your_rsa_private_key_base64'
+ANTHROPIC_API_KEY = your_anthropic_key
+```
 
 **3. Start the trader daemon** (terminal 1)
 ```
 python trader.py
 ```
-On first run this creates `trading_config.json` with `dry_run: true` and
-`enabled: false`. No orders will be placed.
+Creates `trading_config.json` with `dry_run: true` and `enabled: false` on first run.
+No orders will be placed until you explicitly enable them.
 
-**4. Start the dashboard** (terminal 2)
+**4. Start the long-term dashboard** (terminal 2)
 ```
 streamlit run dashboard.py
 ```
-Open `http://localhost:8501` in your browser.
+Open `http://localhost:8501`
+
+**5. Start the short-term monitor** (terminal 3)
+```
+streamlit run monitor.py --server.port 8502
+```
+Open `http://localhost:8502`
 
 ---
 
 ## Going Live
 
-Before enabling real trading, run in dry-run mode for at least a few cycles
-to confirm that:
-- The daemon is picking up signal changes correctly
-- The Kalshi market selection looks sensible
-- The order sizes and costs are what you expect
+Before enabling real trading, run in dry-run mode for at least several cycles to
+confirm signals look correct and order sizing is reasonable.
 
-When you are ready:
-
-1. Open the dashboard at `http://localhost:8501`
+When ready:
+1. Open `http://localhost:8501`
 2. Scroll to **Trading Configuration**
-3. Uncheck **Dry Run**
-4. Check **Enable live trading**
-5. Set your **Max contracts** and **Max open risk (USD)** limits
-6. Click **Save Configuration**
+3. Uncheck **Dry Run** → check **Enable live trading**
+4. Set your **Max contracts** and **Max open risk (USD)** conservatively
+5. Click **Save Configuration**
 
-The daemon will pick up the change on its next cycle (within 60 seconds) and
-begin placing real orders on Kalshi.
+The daemon picks up the change within 60 seconds.
 
-To stop trading at any time: re-check **Dry Run** or uncheck **Enable live
-trading** in the dashboard, then click Save. Takes effect within one cycle.
-Emergency stop: edit `trading_config.json` directly and set `"enabled": false`.
+**Emergency stop:** set `"enabled": false` directly in `trading_config.json`,
+or use the dashboard toggle. Takes effect within one cycle.
 
 ---
 
-## How the Signal Maps to Kalshi Orders
+## How the Signal Maps to Kalshi
 
-Kalshi BTC markets are binary questions of the form:
-*"Will Bitcoin be above $X on [date]?"*
+Kalshi BTC markets are binary: *"Will Bitcoin be above $X on [date]?"*
 
-| Signal | Side | Reasoning |
+| Signal | Side | Logic |
 |---|---|---|
-| STRONG BUY / BUY | Buy YES | We expect BTC to rise — bet it closes above the strike |
-| STRONG SELL / SELL | Buy NO | We expect BTC to fall — bet it closes below the strike |
-| HOLD | No order | No clear edge, stay flat |
+| STRONG BUY / BUY | Buy YES | Expect BTC to rise above the strike |
+| STRONG SELL / SELL | Buy NO | Expect BTC to stay below the strike |
+| HOLD | No order | No clear edge — stay flat |
 
-The market selector prefers contracts where the relevant side is priced
-between 15–85 cents, meaning the market considers the outcome genuinely
-uncertain. This is where your signal has the most value.
+The market selector targets contracts where the relevant side is priced 15–85 cents
+(genuinely uncertain outcome — maximum value for your signal).
 
 ---
 
@@ -288,7 +233,7 @@ uncertain. This is where your signal has the most value.
 
 - This system places real financial bets on Kalshi using your account funds.
 - Past indicator signals do not guarantee future performance.
-- Kalshi contracts can expire worthless — you can lose 100% of what you bet.
-- Start with the minimum `max_contracts` (1) and `max_open_risk_usd` ($10)
-  until you have validated the strategy over multiple real cycles.
+- Kalshi binary options can expire worthless — you can lose 100% of what you bet.
+- Start with `max_contracts: 1` and `max_open_risk_usd: 10` until you have validated
+  the strategy over multiple live cycles.
 - Always monitor `trader.log` when live trading is active.

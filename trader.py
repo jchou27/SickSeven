@@ -1,12 +1,12 @@
 """
-Autonomous BTC trading daemon.
+Autonomous BTC/Kalshi trading daemon.
 
 Usage:
     python trader.py
 
-The daemon reads trading_config.json each cycle, so you can change settings
-(including enable/disable) at runtime without restarting. State is written to
-trading_state.json for the dashboard to display.
+Reads trading_config.json each cycle — change settings (including enable/disable,
+stop-loss, and cooldown) at runtime without restarting.  Writes all state to
+trading_state.json for the dashboard to read.
 """
 import json
 import logging
@@ -24,11 +24,11 @@ from strategy import compute_indicators, generate_signal, select_market, compute
 
 load_dotenv()
 
-GECKO_API_KEY  = os.getenv("GECKO_API", "")
-GECKO_BASE     = "https://api.coingecko.com/api/v3"
-STATE_FILE     = Path("trading_state.json")
-CONFIG_FILE    = Path("trading_config.json")
-LOG_FILE       = Path("trader.log")
+GECKO_API_KEY = os.getenv("GECKO_API", "")
+GECKO_BASE    = "https://api.coingecko.com/api/v3"
+STATE_FILE    = Path("trading_state.json")
+CONFIG_FILE   = Path("trading_config.json")
+LOG_FILE      = Path("trader.log")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,18 +41,20 @@ logging.basicConfig(
 log = logging.getLogger("trader")
 
 DEFAULT_CONFIG: dict = {
-    "enabled":            False,   # must be set True to place real orders
+    "enabled":            False,   # master switch — must be True to place real orders
+    "dry_run":            True,    # log orders but never actually send them
     "series_ticker":      "KXBTCD",
     "max_contracts":      5,
-    "max_open_risk_usd":  50.0,    # stop placing orders when open risk >= this
-    "only_on_change":     True,    # skip order if signal hasn't changed
+    "max_open_risk_usd":  50.0,    # refuse new orders when total open cost exceeds this
+    "stop_loss_pct":      0.40,    # close a position when its loss exceeds 40% of cost
+    "only_on_change":     True,    # skip order if signal label hasn't changed
+    "cooldown_minutes":   15,      # minimum minutes between consecutive orders
     "loop_interval_sec":  60,
-    "dry_run":            True,    # log orders but don't actually send them
 }
 
 
 # ---------------------------------------------------------------------------
-# Config / state helpers
+# Config / state I/O
 # ---------------------------------------------------------------------------
 
 def load_config() -> dict:
@@ -84,24 +86,25 @@ def save_state(state: dict):
 
 def _empty_state() -> dict:
     return {
-        "is_running":        False,
-        "enabled":           False,
-        "dry_run":           True,
-        "last_run":          None,
-        "last_signal":       None,
-        "last_signal_time":  None,
-        "current_price":     None,
-        "current_indicators": {},
-        "balance_cents":     None,
-        "active_positions":  [],
-        "recent_orders":     [],
+        "is_running":             False,
+        "enabled":                False,
+        "dry_run":                True,
+        "last_run":               None,
+        "last_signal":            None,
+        "last_signal_time":       None,
+        "last_order_time":        None,
+        "current_price":          None,
+        "current_indicators":     {},
+        "balance_cents":          None,
+        "active_positions":       [],
+        "recent_orders":          [],
         "total_realized_pnl_cents": 0,
-        "errors":            [],
+        "errors":                 [],
     }
 
 
 # ---------------------------------------------------------------------------
-# Data helpers
+# Data fetch
 # ---------------------------------------------------------------------------
 
 def fetch_price_history() -> pd.Series:
@@ -113,14 +116,55 @@ def fetch_price_history() -> pd.Series:
     return pd.Series([p[1] for p in r.json()["prices"]])
 
 
+# ---------------------------------------------------------------------------
+# Risk helpers
+# ---------------------------------------------------------------------------
+
 def open_risk_usd(positions: list) -> float:
-    """Rough cost basis of all open long positions."""
+    """Total cost basis of all open positions in USD."""
     total = 0.0
     for p in positions:
-        contracts = abs(p.get("position", 0))
-        cost_cents = p.get("market_exposure", 0) or p.get("total_cost", 0) or 0
-        total += contracts * cost_cents / 100
+        # total_cost is the aggregate cents paid for this position
+        cost_cents = abs(p.get("total_cost", 0) or 0)
+        total += cost_cents / 100
     return total
+
+
+def positions_to_close(positions: list, stop_loss_pct: float) -> list:
+    """
+    Return positions whose unrealized loss exceeds stop_loss_pct of cost.
+    e.g. stop_loss_pct=0.40 → close when down 40%.
+    """
+    to_close = []
+    for p in positions:
+        total_cost   = abs(p.get("total_cost",     0) or 0)
+        unrealized   =     p.get("unrealized_pnl", 0) or 0
+        if total_cost > 0 and (unrealized / total_cost) < -stop_loss_pct:
+            to_close.append(p)
+    return to_close
+
+
+def already_positioned(positions: list, ticker: str) -> bool:
+    """True if we already hold a non-zero position on this market."""
+    return any(p.get("ticker") == ticker and (p.get("position") or 0) != 0
+               for p in positions)
+
+
+def cooldown_remaining(last_order_iso: Optional[str], cooldown_minutes: float) -> float:
+    """Returns seconds remaining in cooldown, or 0 if cooldown has expired."""
+    if not last_order_iso:
+        return 0.0
+    try:
+        last = datetime.fromisoformat(last_order_iso)
+        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+        remaining = cooldown_minutes * 60 - elapsed
+        return max(0.0, remaining)
+    except Exception:
+        return 0.0
+
+
+# Bring Optional into scope (used by cooldown_remaining type hint)
+from typing import Optional
 
 
 # ---------------------------------------------------------------------------
@@ -129,12 +173,12 @@ def open_risk_usd(positions: list) -> float:
 
 def run_cycle(config: dict, state: dict) -> dict:
     now = datetime.now(timezone.utc).isoformat()
-    state["last_run"]   = now
-    state["enabled"]    = config["enabled"]
-    state["dry_run"]    = config["dry_run"]
-    state["errors"]     = []
+    state["last_run"] = now
+    state["enabled"]  = config["enabled"]
+    state["dry_run"]  = config["dry_run"]
+    state["errors"]   = []
 
-    # 1. Compute signal
+    # ── 1. Compute signal ────────────────────────────────────────────────────
     try:
         prices     = fetch_price_history()
         indicators = compute_indicators(prices)
@@ -145,29 +189,53 @@ def run_cycle(config: dict, state: dict) -> dict:
 
         prev_label = state.get("last_signal")
         if signal["label"] != prev_label:
-            log.info(f"Signal change: {prev_label} → {signal['label']}  "
-                     f"(RSI={signal['rsi']:.1f}, score={signal['bull_score']:+d})")
+            log.info(
+                f"Signal change: {prev_label} → {signal['label']}  "
+                f"RSI={signal['rsi']:.1f}  MACD={signal['macd']:.1f}  "
+                f"score={signal['bull_score']:+d}"
+            )
             state["last_signal"]      = signal["label"]
             state["last_signal_time"] = now
         else:
-            log.info(f"Signal unchanged: {signal['label']}  (RSI={signal['rsi']:.1f})")
+            log.info(
+                f"Signal unchanged: {signal['label']}  "
+                f"RSI={signal['rsi']:.1f}  score={signal['bull_score']:+d}"
+            )
     except Exception as e:
         log.error(f"Signal computation failed: {e}", exc_info=True)
         state["errors"].append(f"Signal: {e}")
         return state
 
-    # 2. Refresh portfolio
+    # ── 2. Refresh portfolio ─────────────────────────────────────────────────
     try:
         bal = kc.get_balance()
-        state["balance_cents"] = bal.get("balance", 0)
-
-        positions = kc.get_positions()
+        state["balance_cents"]   = bal.get("balance", 0)
+        positions                = kc.get_positions()
         state["active_positions"] = positions
     except Exception as e:
         log.warning(f"Portfolio refresh failed: {e}")
         state["errors"].append(f"Portfolio: {e}")
+        positions = state.get("active_positions", [])
 
-    # 3. Guard rails before placing any order
+    # ── 3. Stop-loss exits ───────────────────────────────────────────────────
+    if config.get("enabled") and not config.get("dry_run"):
+        stop_pct   = config.get("stop_loss_pct", 0.40)
+        for p in positions_to_close(positions, stop_pct):
+            ticker  = p.get("ticker", "")
+            net_pos = p.get("position", 0)
+            pnl_pct = ((p.get("unrealized_pnl") or 0) / max(abs(p.get("total_cost") or 1), 1)) * 100
+            log.warning(
+                f"Stop-loss triggered on {ticker}: "
+                f"P&L={pnl_pct:.1f}% < -{stop_pct*100:.0f}%"
+            )
+            try:
+                kc.close_position(ticker, net_pos)
+                state["errors"].append(f"Stop-loss closed {ticker} ({pnl_pct:.1f}%)")
+            except Exception as e:
+                log.error(f"Stop-loss close failed for {ticker}: {e}")
+                state["errors"].append(f"Stop-loss error {ticker}: {e}")
+
+    # ── 4. Guard rails ───────────────────────────────────────────────────────
     if not config["enabled"]:
         log.info("Trading disabled — no order placed")
         return state
@@ -177,22 +245,29 @@ def run_cycle(config: dict, state: dict) -> dict:
         return state
 
     if config["only_on_change"] and signal["label"] == prev_label:
-        log.info("Signal unchanged and only_on_change=true — skipping")
+        log.info("Signal unchanged and only_on_change=True — skipping")
         return state
 
+    # Cooldown check
+    cd_secs = cooldown_remaining(state.get("last_order_time"), config.get("cooldown_minutes", 15))
+    if cd_secs > 0:
+        log.info(f"Cooldown active — {cd_secs:.0f}s remaining")
+        return state
+
+    # Risk cap
     risk = open_risk_usd(state.get("active_positions", []))
     if risk >= config["max_open_risk_usd"]:
-        msg = f"Open risk ${risk:.2f} >= limit ${config['max_open_risk_usd']} — skipping"
+        msg = f"Open risk ${risk:.2f} >= cap ${config['max_open_risk_usd']} — skipping"
         log.warning(msg)
         state["errors"].append(msg)
         return state
 
-    # 4. Select market and size order
+    # ── 5. Select market and size order ──────────────────────────────────────
     try:
-        series   = config.get("series_ticker", "KXBTCD")
-        markets  = kc.get_markets(series_ticker=series)
+        series  = config.get("series_ticker", "KXBTCD")
+        markets = kc.get_markets(series_ticker=series)
         if not markets:
-            log.warning(f"No markets for {series}, falling back to BTC keyword search")
+            log.warning(f"No markets for {series} — falling back to BTC keyword search")
             markets = kc.search_markets("btc")
 
         market = select_market(markets, signal["direction"])
@@ -200,19 +275,30 @@ def run_cycle(config: dict, state: dict) -> dict:
             state["errors"].append("No suitable market found")
             return state
 
-        order_params = compute_order(signal, market, config["max_contracts"])
+        # Don't double into an existing position on the same market
+        if already_positioned(state.get("active_positions", []), market["ticker"]):
+            log.info(f"Already positioned on {market['ticker']} — skipping")
+            return state
+
+        order_params = compute_order(
+            signal,
+            market,
+            config["max_contracts"],
+            atr_pct=indicators.get("atr_pct", 0.003),
+        )
         if not order_params:
-            log.info("No order computed (missing price?)")
+            log.info("No order computed (missing price data?)")
             return state
     except Exception as e:
         log.error(f"Market/order selection failed: {e}", exc_info=True)
         state["errors"].append(f"Selection: {e}")
         return state
 
-    # 5. Execute (or dry-run)
+    # ── 6. Execute (or dry-run) ───────────────────────────────────────────────
     order_record = {
         "timestamp":   now,
         "signal":      signal["label"],
+        "bull_score":  signal["bull_score"],
         "ticker":      order_params["ticker"],
         "side":        order_params["side"],
         "count":       order_params["count"],
@@ -224,7 +310,7 @@ def run_cycle(config: dict, state: dict) -> dict:
     }
 
     if config["dry_run"]:
-        log.info(f"[DRY RUN] Would place: {order_params}")
+        log.info(f"[DRY RUN] Would place: {order_params['rationale']}")
         order_record["result"] = "dry_run"
     else:
         try:
@@ -237,6 +323,7 @@ def run_cycle(config: dict, state: dict) -> dict:
                 price_cents = order_params["price_cents"],
             )
             order_record["result"] = result
+            state["last_order_time"] = now
             log.info(f"Order placed: {result}")
         except Exception as e:
             log.error(f"Order placement failed: {e}", exc_info=True)
@@ -252,7 +339,6 @@ def run_cycle(config: dict, state: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def main():
-    # Write default config if it doesn't exist
     if not CONFIG_FILE.exists():
         save_config(DEFAULT_CONFIG)
         log.info(f"Created default config at {CONFIG_FILE}")

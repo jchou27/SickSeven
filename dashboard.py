@@ -14,62 +14,82 @@ from plotly.subplots import make_subplots
 from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
 
+# All indicator and signal logic lives in strategy.py — no duplication here
+from strategy import add_chart_indicators, generate_signal, compute_indicators
+
 load_dotenv()
 
-GECKO_API_KEY  = os.getenv("GECKO_API", "")
-KALSHI_KEY_ID  = os.getenv("KALSHI_API_KEY", "")
+GECKO_API_KEY   = os.getenv("GECKO_API", "")
+KALSHI_KEY_ID   = os.getenv("KALSHI_API_KEY", "")
 KALSHI_PRIV_RAW = os.getenv("KALSHI_PRIV", "")
-GECKO_BASE     = "https://api.coingecko.com/api/v3"
+GECKO_BASE      = "https://api.coingecko.com/api/v3"
 KALSHI_BASE_URL = "https://api.kalshi.com"
 KALSHI_API_PFX  = "/trade-api/v2"
-STATE_FILE     = Path("trading_state.json")
-CONFIG_FILE    = Path("trading_config.json")
+STATE_FILE      = Path("trading_state.json")
+CONFIG_FILE     = Path("trading_config.json")
 
 DEFAULT_CONFIG = {
-    "enabled":           False,
-    "series_ticker":     "KXBTCD",
-    "max_contracts":     5,
-    "max_open_risk_usd": 50.0,
-    "only_on_change":    True,
-    "loop_interval_sec": 60,
-    "dry_run":           True,
+    "enabled":            False,
+    "dry_run":            True,
+    "series_ticker":      "KXBTCD",
+    "max_contracts":      5,
+    "max_open_risk_usd":  50.0,
+    "stop_loss_pct":      0.40,
+    "only_on_change":     True,
+    "cooldown_minutes":   15,
+    "loop_interval_sec":  60,
 }
 
+SIGNAL_COLORS = {
+    "STRONG BUY":  "#00C853",
+    "BUY":         "#69F0AE",
+    "HOLD":        "#FFD600",
+    "SELL":        "#FF5252",
+    "STRONG SELL": "#D50000",
+}
+
+
 # ---------------------------------------------------------------------------
-# Kalshi auth (needed for live market data in dashboard)
+# Kalshi auth (fresh signature per call — fixes stale-timestamp retry bug)
 # ---------------------------------------------------------------------------
 
 def _load_kalshi_key():
     if not KALSHI_PRIV_RAW:
         return None
+    raw_b64 = "".join(KALSHI_PRIV_RAW.split())
+    lines   = textwrap.wrap(raw_b64, 64)
     try:
         from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.backends import default_backend
-        raw_b64 = "".join(KALSHI_PRIV_RAW.split())
-        lines = textwrap.wrap(raw_b64, 64)
         for hdr in ("RSA PRIVATE KEY", "PRIVATE KEY"):
             try:
-                pem = f"-----BEGIN {hdr}-----\n" + "\n".join(lines) + f"\n-----END {hdr}-----"
-                return serialization.load_pem_private_key(pem.encode(), password=None, backend=default_backend())
+                pem = (f"-----BEGIN {hdr}-----\n"
+                       + "\n".join(lines)
+                       + f"\n-----END {hdr}-----")
+                return serialization.load_pem_private_key(
+                    pem.encode(), password=None, backend=default_backend()
+                )
             except Exception:
                 pass
     except Exception as e:
         st.warning(f"Kalshi key load error: {e}")
     return None
 
+
 _KAL_KEY = _load_kalshi_key()
 
 
-def kalshi_signed(method: str, path: str) -> dict:
+def _kalshi_headers(path: str) -> dict:
+    """Generate fresh signed headers. Called individually per request."""
     if not _KAL_KEY or not KALSHI_KEY_ID:
         return {}
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
-    ts = str(int(time.time() * 1000))
-    msg = (ts + method.upper() + KALSHI_API_PFX + path).encode()
+    ts  = str(int(time.time() * 1000))
+    msg = (ts + "GET" + KALSHI_API_PFX + path).encode()
     sig = _KAL_KEY.sign(msg, padding.PKCS1v15(), hashes.SHA256())
     return {
-        "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
+        "KALSHI-ACCESS-KEY":       KALSHI_KEY_ID,
         "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
         "KALSHI-ACCESS-TIMESTAMP": ts,
     }
@@ -102,90 +122,47 @@ def fetch_ohlc(days: int = 7) -> pd.DataFrame:
 
 @st.cache_data(ttl=120)
 def fetch_price_history(days: int = 30) -> pd.DataFrame:
+    """Returns hourly price + volume DataFrame for indicator computation."""
     url = (f"{GECKO_BASE}/coins/bitcoin/market_chart?vs_currency=usd"
            f"&days={days}&interval=hourly&x_cg_demo_api_key={GECKO_API_KEY}")
     r = requests.get(url, timeout=10)
     r.raise_for_status()
-    df = pd.DataFrame(r.json()["prices"], columns=["ts", "price"])
+    data    = r.json()
+    prices  = pd.DataFrame(data["prices"],        columns=["ts", "price"])
+    volumes = pd.DataFrame(data["total_volumes"],  columns=["ts", "volume"])
+    df      = prices.merge(volumes, on="ts")
     df["ts"] = pd.to_datetime(df["ts"], unit="ms")
     return df
 
 
 @st.cache_data(ttl=60)
 def fetch_kalshi_markets() -> list:
+    """Try KXBTCD series first; fall back to keyword search. Fresh signature each attempt."""
     path = "/markets"
-    headers = kalshi_signed("GET", path)
-    if not headers:
-        return []
-    for params in ("?series_ticker=KXBTCD&limit=20&status=open",
-                   "?limit=50&status=open"):
+    for query in ("?series_ticker=KXBTCD&limit=20&status=open",
+                  "?limit=50&status=open"):
+        headers = _kalshi_headers(path)   # fresh signature every attempt
+        if not headers:
+            break
         try:
             r = requests.get(
-                KALSHI_BASE_URL + KALSHI_API_PFX + "/markets" + params,
+                KALSHI_BASE_URL + KALSHI_API_PFX + path + query,
                 headers=headers, timeout=10,
             )
             if r.status_code == 200:
                 markets = r.json().get("markets", [])
-                if "series_ticker=KXBTCD" in params:
+                if "series_ticker=KXBTCD" in query:
                     if markets:
                         return markets
                 else:
                     btc = [m for m in markets
-                           if "btc" in m.get("ticker", "").lower()
-                           or "bitcoin" in m.get("title", "").lower()]
+                           if "btc"     in m.get("ticker", "").lower()
+                           or "bitcoin" in m.get("title",  "").lower()]
                     if btc:
                         return btc
         except requests.RequestException:
             pass
     return []
-
-
-# ---------------------------------------------------------------------------
-# Indicators
-# ---------------------------------------------------------------------------
-
-def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    d = series.diff()
-    gain = d.clip(lower=0).ewm(com=period - 1, adjust=False).mean()
-    loss = (-d.clip(upper=0)).ewm(com=period - 1, adjust=False).mean()
-    rs = gain / loss.replace(0, float("nan"))
-    return 100 - (100 / (1 + rs))
-
-
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["sma20"] = df["price"].rolling(20).mean()
-    df["sma50"] = df["price"].rolling(50).mean()
-    df["ema20"] = df["price"].ewm(span=20, adjust=False).mean()
-    df["rsi14"] = compute_rsi(df["price"])
-    return df
-
-
-def get_signal(df: pd.DataFrame) -> tuple[str, str, int]:
-    """Returns (label, direction, bull_score)."""
-    last = df.dropna(subset=["sma20", "sma50", "rsi14"]).iloc[-1]
-    rsi  = last["rsi14"]
-    ma_bull  = last["sma20"] > last["sma50"]
-    ema_bull = last["price"] > last["ema20"]
-    score = 0
-    score += 2 if rsi < 30 else (1 if rsi < 40 else 0)
-    score -= 2 if rsi > 70 else (1 if rsi > 60 else 0)
-    score += 1 if ma_bull  else -1
-    score += 1 if ema_bull else -1
-    if score >= 3:   return "STRONG BUY",  "up",      score
-    if score >= 1:   return "BUY",          "up",      score
-    if score <= -3:  return "STRONG SELL",  "down",    score
-    if score <= -1:  return "SELL",          "down",    score
-    return "HOLD", "neutral", score
-
-
-SIGNAL_COLORS = {
-    "STRONG BUY":  "#00C853",
-    "BUY":         "#69F0AE",
-    "HOLD":        "#FFD600",
-    "SELL":        "#FF5252",
-    "STRONG SELL": "#D50000",
-}
 
 
 # ---------------------------------------------------------------------------
@@ -226,26 +203,31 @@ st.title("₿  BTC/USD Live Dashboard")
 st.caption(f"Auto-refreshes every 30 s  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # ---------------------------------------------------------------------------
-# Fetch all data
+# Fetch
 # ---------------------------------------------------------------------------
 
 with st.spinner("Loading market data…"):
-    price_data    = fetch_btc_price()
-    ohlc_df       = fetch_ohlc(days=7)
-    hist_df       = fetch_price_history(days=30)
-    kalshi_mkts   = fetch_kalshi_markets()
-    trader_state  = load_trader_state()
-    config        = load_config()
+    price_data   = fetch_btc_price()
+    ohlc_df      = fetch_ohlc(days=7)
+    hist_df      = fetch_price_history(days=30)
+    kalshi_mkts  = fetch_kalshi_markets()
+    trader_state = load_trader_state()
+    config       = load_config()
 
-hist_df     = add_indicators(hist_df)
-sig_label, sig_dir, sig_score = get_signal(hist_df)
-sig_color   = SIGNAL_COLORS.get(sig_label, "#FFD600")
-rsi_series  = hist_df["rsi14"].dropna()
-current_rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else None
+# Build full indicator series (from strategy.py — single source of truth)
+hist_df = add_chart_indicators(hist_df)
 
-price     = price_data["usd"]
-chg_24h   = price_data.get("usd_24h_change", 0.0)
-vol_24h   = price_data.get("usd_24h_vol", 0.0)
+# Get current signal using latest indicator values
+ind_latest = compute_indicators(hist_df["price"])
+signal     = generate_signal(ind_latest)
+sig_label  = signal["label"]
+sig_color  = SIGNAL_COLORS.get(sig_label, "#FFD600")
+sig_score  = signal["bull_score"]
+
+price   = price_data["usd"]
+chg_24h = price_data.get("usd_24h_change", 0.0)
+vol_24h = price_data.get("usd_24h_vol",    0.0)
+cur_rsi = ind_latest["rsi"]
 
 # ---------------------------------------------------------------------------
 # Metric row
@@ -253,81 +235,180 @@ vol_24h   = price_data.get("usd_24h_vol", 0.0)
 
 c1, c2, c3, c4, c5 = st.columns(5)
 
-c1.metric("BTC Price", f"${price:,.2f}", f"{chg_24h:+.2f}%")
+c1.metric("BTC Price",  f"${price:,.2f}",      f"{chg_24h:+.2f}%")
 c2.metric("24h Volume", f"${vol_24h / 1e9:.2f}B")
 
-if current_rsi is not None:
-    rsi_lbl = "Overbought" if current_rsi > 70 else ("Oversold" if current_rsi < 30 else "Neutral")
-    c3.metric("RSI (14)", f"{current_rsi:.1f}", rsi_lbl)
+rsi_zone = "Overbought" if cur_rsi > 70 else ("Oversold" if cur_rsi < 30 else "Neutral")
+c3.metric("RSI (14)", f"{cur_rsi:.1f}", rsi_zone)
 
+macd_val  = ind_latest["macd"]
+macd_sig  = ind_latest["macd_signal"]
+macd_str  = f"{'▲' if macd_val > macd_sig else '▼'} {macd_val:+.1f}"
 c4.markdown(
     f"<div style='text-align:center;padding:12px 6px;border-radius:8px;"
     f"background:{sig_color}18;border:2px solid {sig_color}'>"
-    f"<div style='font-size:0.75em;color:#aaa;margin-bottom:4px'>Strategy Signal</div>"
+    f"<div style='font-size:0.75em;color:#aaa;margin-bottom:2px'>Strategy Signal</div>"
     f"<div style='font-size:1.5em;font-weight:700;color:{sig_color}'>{sig_label}</div>"
-    f"<div style='font-size:0.75em;color:#aaa'>score {sig_score:+d}</div>"
+    f"<div style='font-size:0.75em;color:#aaa'>score {sig_score:+d} · MACD {macd_str}</div>"
     f"</div>",
     unsafe_allow_html=True,
 )
 
+# Kalshi card: show the side relevant to our current signal direction
 if kalshi_mkts:
     m0 = kalshi_mkts[0]
-    yes_p = m0.get("yes_ask") or m0.get("last_price")
+    if signal["direction"] == "up":
+        mkt_price = m0.get("yes_ask")
+        mkt_label = "YES ask"
+    elif signal["direction"] == "down":
+        mkt_price = m0.get("no_ask")
+        mkt_label = "NO ask"
+    else:
+        mkt_price = m0.get("yes_ask") or m0.get("last_price")
+        mkt_label = "YES ask"
+    ticker_short = m0.get("ticker", "BTC")[:16]
     c5.metric(
-        f"Kalshi: {m0.get('ticker','BTC')[:16]}",
-        f"{yes_p}¢" if isinstance(yes_p, (int, float)) else "N/A",
+        f"Kalshi: {ticker_short}",
+        f"{mkt_price}¢  ({mkt_price}% prob)" if isinstance(mkt_price, (int, float)) else "N/A",
+        mkt_label,
     )
 else:
-    c5.metric("Kalshi", "N/A", "no markets")
+    c5.metric("Kalshi", "N/A", "no open markets")
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Price chart + RSI
+# Main chart: Price + BB + MAs | RSI | MACD
 # ---------------------------------------------------------------------------
 
 fig = make_subplots(
-    rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3],
-    vertical_spacing=0.04,
-    subplot_titles=("BTC/USD — 7-day OHLC + 30-day MAs", "RSI (14)"),
+    rows=3, cols=1,
+    shared_xaxes=True,
+    row_heights=[0.55, 0.22, 0.23],
+    vertical_spacing=0.03,
+    subplot_titles=(
+        "BTC/USD — 7-day OHLC  ·  Bollinger Bands (20, 2σ)  ·  Moving Averages",
+        "RSI (14)",
+        "MACD (12 / 26 / 9)",
+    ),
+    specs=[[{"secondary_y": True}], [{"secondary_y": False}], [{"secondary_y": False}]],
 )
 
+# ── Row 1: Candlesticks ───────────────────────────────────────────────────
 fig.add_trace(go.Candlestick(
-    x=ohlc_df["ts"], open=ohlc_df["open"], high=ohlc_df["high"],
-    low=ohlc_df["low"], close=ohlc_df["close"], name="OHLC",
-    increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
-), row=1, col=1)
+    x=ohlc_df["ts"],
+    open=ohlc_df["open"], high=ohlc_df["high"],
+    low=ohlc_df["low"],   close=ohlc_df["close"],
+    name="OHLC",
+    increasing_line_color="#26a69a",
+    decreasing_line_color="#ef5350",
+    showlegend=True,
+), row=1, col=1, secondary_y=False)
 
+# ── Row 1: Bollinger Bands (filled channel) ───────────────────────────────
+fig.add_trace(go.Scatter(
+    x=hist_df["ts"], y=hist_df["bb_upper"], name="BB Upper",
+    line=dict(color="rgba(100,149,237,0.6)", width=1, dash="dot"),
+    showlegend=True,
+), row=1, col=1, secondary_y=False)
+
+fig.add_trace(go.Scatter(
+    x=hist_df["ts"], y=hist_df["bb_lower"], name="BB Lower",
+    line=dict(color="rgba(100,149,237,0.6)", width=1, dash="dot"),
+    fill="tonexty",
+    fillcolor="rgba(100,149,237,0.05)",
+    showlegend=True,
+), row=1, col=1, secondary_y=False)
+
+fig.add_trace(go.Scatter(
+    x=hist_df["ts"], y=hist_df["bb_mid"], name="BB Mid (SMA20)",
+    line=dict(color="rgba(100,149,237,0.4)", width=1),
+    showlegend=False,
+), row=1, col=1, secondary_y=False)
+
+# ── Row 1: Moving averages ────────────────────────────────────────────────
 for col_name, label, color, dash in [
-    ("sma20", "SMA 20", "#FFA726", "solid"),
-    ("sma50", "SMA 50", "#42A5F5", "solid"),
-    ("ema20", "EMA 20", "#AB47BC", "dash"),
+    ("sma50",  "SMA 50",  "#42A5F5", "solid"),
+    ("ema20",  "EMA 20",  "#AB47BC", "dash"),
+    ("ema200", "EMA 200", "#FF7043", "dot"),
 ]:
     fig.add_trace(go.Scatter(
         x=hist_df["ts"], y=hist_df[col_name], name=label,
         line=dict(color=color, width=1.5, dash=dash),
-    ), row=1, col=1)
+    ), row=1, col=1, secondary_y=False)
 
+# ── Row 1: Volume bars (secondary y) ────────────────────────────────────
+vol_colors = [
+    "#26a69a" if close >= open_ else "#ef5350"
+    for close, open_ in zip(ohlc_df["close"], ohlc_df["open"])
+]
+fig.add_trace(go.Bar(
+    x=ohlc_df["ts"], y=ohlc_df["close"] - ohlc_df["close"],  # placeholder for alignment
+    name="", showlegend=False, visible=False,
+), row=1, col=1, secondary_y=True)  # dummy to initialise secondary axis
+
+fig.add_trace(go.Bar(
+    x=hist_df["ts"], y=hist_df["volume"],
+    name="Volume",
+    marker_color="rgba(150,150,150,0.25)",
+    showlegend=True,
+), row=1, col=1, secondary_y=True)
+
+# ── Row 2: RSI ────────────────────────────────────────────────────────────
 fig.add_trace(go.Scatter(
     x=hist_df["ts"], y=hist_df["rsi14"], name="RSI 14",
     line=dict(color="#66BB6A", width=2),
-    fill="tozeroy", fillcolor="rgba(102,187,106,0.05)",
 ), row=2, col=1)
 
-for y_val, clr in [(70, "red"), (30, "green")]:
-    fig.add_hline(y=y_val, line_dash="dash", line_color=clr, line_width=1, row=2, col=1)
 fig.add_hrect(y0=70, y1=100, fillcolor="red",   opacity=0.07, row=2, col=1, line_width=0)
 fig.add_hrect(y0=0,  y1=30,  fillcolor="green", opacity=0.07, row=2, col=1, line_width=0)
-fig.add_hline(y=50, line_dash="dot", line_color="grey", line_width=1, row=2, col=1)
+for y_val, clr in [(70, "red"), (50, "grey"), (30, "green")]:
+    fig.add_hline(
+        y=y_val,
+        line_dash="dash" if y_val != 50 else "dot",
+        line_color=clr, line_width=1,
+        row=2, col=1,
+    )
 
+# ── Row 3: MACD ───────────────────────────────────────────────────────────
+hist_colors = [
+    "#26a69a" if v >= 0 else "#ef5350"
+    for v in hist_df["macd_hist"].fillna(0)
+]
+fig.add_trace(go.Bar(
+    x=hist_df["ts"], y=hist_df["macd_hist"],
+    name="MACD Hist",
+    marker_color=hist_colors,
+    opacity=0.6,
+), row=3, col=1)
+
+fig.add_trace(go.Scatter(
+    x=hist_df["ts"], y=hist_df["macd"], name="MACD",
+    line=dict(color="#42A5F5", width=1.5),
+), row=3, col=1)
+
+fig.add_trace(go.Scatter(
+    x=hist_df["ts"], y=hist_df["macd_signal"], name="Signal",
+    line=dict(color="#FF7043", width=1.5),
+), row=3, col=1)
+
+fig.add_hline(y=0, line_dash="dot", line_color="grey", line_width=1, row=3, col=1)
+
+# ── Layout ────────────────────────────────────────────────────────────────
 fig.update_layout(
-    height=720, xaxis_rangeslider_visible=False, template="plotly_dark",
+    height=820,
+    xaxis_rangeslider_visible=False,
+    template="plotly_dark",
     showlegend=True,
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    margin=dict(l=10, r=10, t=60, b=10),
+    margin=dict(l=10, r=10, t=70, b=10),
+    bargap=0,
 )
-fig.update_yaxes(title_text="Price (USD)", row=1, col=1)
-fig.update_yaxes(title_text="RSI", range=[0, 100], row=2, col=1)
+fig.update_yaxes(title_text="Price (USD)", row=1, col=1, secondary_y=False)
+fig.update_yaxes(title_text="Volume",      row=1, col=1, secondary_y=True,
+                 showgrid=False, tickformat=".2s")
+fig.update_yaxes(title_text="RSI",         row=2, col=1, range=[0, 100])
+fig.update_yaxes(title_text="MACD",        row=3, col=1)
 
 st.plotly_chart(fig, use_container_width=True)
 
@@ -340,66 +421,80 @@ if kalshi_mkts:
     rows = []
     for m in kalshi_mkts:
         ct = (m.get("close_time") or "")[:10]
+        # Highlight the market our signal would trade
+        would_trade = (
+            signal["direction"] in ("up", "down")
+            and m == kalshi_mkts[0]   # first = best by select_market logic
+        )
         rows.append({
+            "★":             "●" if would_trade else "",
             "Ticker":        m.get("ticker", ""),
             "Title":         m.get("title", ""),
             "Yes Ask (¢)":   m.get("yes_ask", "-"),
-            "No Ask (¢)":    m.get("no_ask", "-"),
+            "No Ask (¢)":    m.get("no_ask",  "-"),
             "Last (¢)":      m.get("last_price", "-"),
             "Volume":        f"{m.get('volume', 0):,}",
             "Closes":        ct or "-",
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 else:
-    st.info("No open Kalshi BTC markets — check credentials or markets are closed.")
+    st.info("No open Kalshi BTC markets — check your API credentials.")
 
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Trading dashboard
+# Trading section
 # ---------------------------------------------------------------------------
 
 st.header("Automated Trading")
 
-# Trader daemon status banner
 is_running = trader_state.get("is_running", False)
-is_enabled = trader_state.get("enabled", False)
-is_dry_run = trader_state.get("dry_run", True)
+is_enabled = trader_state.get("enabled",    False)
+is_dry_run = trader_state.get("dry_run",    True)
 
-if is_running and is_enabled and not is_dry_run:
+if   is_running and is_enabled and not is_dry_run:
     st.error("🔴  LIVE TRADING ACTIVE — real orders are being placed on Kalshi")
 elif is_running and is_enabled and is_dry_run:
-    st.warning("🟡  Trader running in DRY RUN mode — signals logged, no real orders sent")
+    st.warning("🟡  Trader running in DRY RUN — signals logged, no real orders sent")
 elif is_running:
     st.info("⚪  Trader daemon is running but trading is disabled")
 else:
     st.info("⚫  Trader daemon is not running.  Start it with:  `python trader.py`")
 
-# Portfolio snapshot from trader state
-tc1, tc2, tc3, tc4 = st.columns(4)
+# Portfolio snapshot
+tc1, tc2, tc3, tc4, tc5 = st.columns(5)
 bal_cents = trader_state.get("balance_cents")
-tc1.metric("Kalshi Balance", f"${bal_cents/100:.2f}" if bal_cents is not None else "—")
+tc1.metric("Kalshi Balance",
+           f"${bal_cents/100:.2f}" if bal_cents is not None else "—")
 
-positions = trader_state.get("active_positions", [])
+positions    = trader_state.get("active_positions", [])
 total_unreal = sum((p.get("unrealized_pnl") or 0) for p in positions)
+total_real   = sum((p.get("realized_pnl")   or 0) for p in positions)
 tc2.metric("Open Positions", len(positions))
 tc3.metric("Unrealized P&L", f"${total_unreal/100:.2f}" if positions else "—")
+tc4.metric("Realized P&L",   f"${total_real/100:.2f}"   if positions else "—")
 
 last_sig_time = trader_state.get("last_signal_time", "")
-tc4.metric("Last Signal Change",
-           last_sig_time[:16].replace("T", " ") if last_sig_time else "—")
+last_ord_time = trader_state.get("last_order_time",  "")
+tc5.metric("Last Order",
+           last_ord_time[:16].replace("T", " ") if last_ord_time else "Never")
 
-# Active positions detail
+# Open positions detail
 if positions:
     st.subheader("Open Positions")
     pos_rows = []
     for p in positions:
+        cost      = abs(p.get("total_cost",     0) or 0)
+        unreal    =     p.get("unrealized_pnl", 0) or 0
+        contracts = abs(p.get("position",       0) or 0)
+        avg_cost  = round(cost / max(contracts, 1), 1)
+        pnl_pct   = (unreal / cost * 100) if cost else 0
         pos_rows.append({
-            "Ticker":          p.get("ticker", ""),
-            "Position":        p.get("position", 0),
-            "Avg Cost (¢)":    round((p.get("total_cost") or 0) / max(abs(p.get("position", 1)), 1), 1),
-            "Unrealized P&L":  f"${(p.get('unrealized_pnl') or 0)/100:.2f}",
-            "Realized P&L":    f"${(p.get('realized_pnl') or 0)/100:.2f}",
+            "Ticker":         p.get("ticker", ""),
+            "Contracts":      p.get("position", 0),
+            "Avg Cost (¢)":   avg_cost,
+            "Unrealized P&L": f"${unreal/100:.2f}  ({pnl_pct:+.1f}%)",
+            "Realized P&L":   f"${(p.get('realized_pnl') or 0)/100:.2f}",
         })
     st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
 
@@ -417,6 +512,7 @@ if recent_orders:
         ord_rows.append({
             "Time":      (o.get("timestamp") or "")[:16].replace("T", " "),
             "Signal":    o.get("signal", ""),
+            "Score":     f"{o.get('bull_score', 0):+d}",
             "Ticker":    o.get("ticker", ""),
             "Side":      o.get("side", "").upper(),
             "Count":     o.get("count", 0),
@@ -427,7 +523,7 @@ if recent_orders:
         })
     st.dataframe(pd.DataFrame(ord_rows), use_container_width=True, hide_index=True)
 
-# Errors
+# Error log
 errs = trader_state.get("errors", [])
 if errs:
     with st.expander(f"⚠ {len(errs)} error(s) from last cycle"):
@@ -437,29 +533,33 @@ if errs:
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Trading configuration panel
+# Configuration panel
 # ---------------------------------------------------------------------------
 
 st.subheader("Trading Configuration")
-st.caption("Changes are written to `trading_config.json` and picked up by the trader daemon on its next cycle.")
+st.caption(
+    "Written to `trading_config.json`.  "
+    "The trader daemon picks up changes on its next cycle — no restart needed."
+)
 
 with st.form("trading_config_form"):
     col_a, col_b = st.columns(2)
 
     with col_a:
         dry_run = st.checkbox(
-            "Dry Run (log signals but place NO real orders)",
+            "Dry Run  (log signals — no real orders)",
             value=config.get("dry_run", True),
         )
         enabled = st.checkbox(
             "Enable live trading",
             value=config.get("enabled", False),
             disabled=dry_run,
-            help="Only available when Dry Run is unchecked",
+            help="Only activates when Dry Run is unchecked",
         )
         only_on_change = st.checkbox(
             "Only trade on signal change",
             value=config.get("only_on_change", True),
+            help="Prevents repeated orders when the signal is flat",
         )
         series_ticker = st.text_input(
             "Kalshi series ticker",
@@ -471,11 +571,25 @@ with st.form("trading_config_form"):
             "Max contracts per trade",
             min_value=1, max_value=100,
             value=int(config.get("max_contracts", 5)),
+            help="STRONG signal uses 100%, regular signal uses 50%.  Scaled down further in high-volatility.",
         )
         max_risk = st.number_input(
             "Max open risk (USD)",
             min_value=1.0, max_value=10_000.0, step=5.0,
             value=float(config.get("max_open_risk_usd", 50.0)),
+            help="No new orders are placed once total cost basis exceeds this.",
+        )
+        stop_loss_pct = st.slider(
+            "Stop-loss threshold (%)",
+            min_value=5, max_value=80,
+            value=int(config.get("stop_loss_pct", 0.40) * 100),
+            help="Close a position when its unrealized loss exceeds this % of cost.",
+        )
+        cooldown_min = st.number_input(
+            "Cooldown between orders (minutes)",
+            min_value=1, max_value=1440,
+            value=int(config.get("cooldown_minutes", 15)),
+            help="Minimum gap between consecutive order placements.",
         )
         loop_interval = st.number_input(
             "Cycle interval (seconds)",
@@ -485,21 +599,22 @@ with st.form("trading_config_form"):
 
     if enabled and not dry_run:
         st.warning(
-            "You are enabling LIVE trading. Real orders will be placed on Kalshi. "
-            "Make sure your max risk and contract limits are set correctly before saving."
+            "⚠  LIVE TRADING will be enabled. Real money will be placed on Kalshi. "
+            "Confirm your risk limits are correct before saving."
         )
 
-    submitted = st.form_submit_button("Save Configuration")
-    if submitted:
+    if st.form_submit_button("Save Configuration"):
         new_cfg = {
-            "enabled":           enabled and not dry_run,
-            "dry_run":           dry_run,
-            "series_ticker":     series_ticker,
-            "max_contracts":     int(max_contracts),
-            "max_open_risk_usd": float(max_risk),
-            "only_on_change":    only_on_change,
-            "loop_interval_sec": int(loop_interval),
+            "enabled":            bool(enabled and not dry_run),
+            "dry_run":            bool(dry_run),
+            "series_ticker":      series_ticker.strip().upper(),
+            "max_contracts":      int(max_contracts),
+            "max_open_risk_usd":  float(max_risk),
+            "stop_loss_pct":      stop_loss_pct / 100.0,
+            "only_on_change":     bool(only_on_change),
+            "cooldown_minutes":   int(cooldown_min),
+            "loop_interval_sec":  int(loop_interval),
         }
         save_config(new_cfg)
-        st.success("Configuration saved. The trader daemon will pick it up on the next cycle.")
+        st.success("Configuration saved. Trader daemon picks it up on its next cycle.")
         st.cache_data.clear()

@@ -1,5 +1,6 @@
-"""Kalshi Trading API v2 client with RSA authentication."""
+"""Kalshi Trading API v2 client with RSA authentication and retry logic."""
 import base64
+import logging
 import os
 import textwrap
 import time
@@ -11,17 +12,23 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_KALSHI_BASE_URL = "https://api.kalshi.com"
-_API_PREFIX = "/trade-api/v2"
-_KEY_ID = os.getenv("KALSHI_API_KEY", "")
-_PRIV_RAW = os.getenv("KALSHI_PRIV", "")
+log = logging.getLogger(__name__)
 
+_KALSHI_BASE_URL = "https://api.kalshi.com"
+_API_PREFIX      = "/trade-api/v2"
+_KEY_ID          = os.getenv("KALSHI_API_KEY", "")
+_PRIV_RAW        = os.getenv("KALSHI_PRIV", "")
+
+
+# ---------------------------------------------------------------------------
+# Key loading
+# ---------------------------------------------------------------------------
 
 def _load_private_key():
     if not _PRIV_RAW:
         raise EnvironmentError("KALSHI_PRIV not set in .env")
     raw_b64 = "".join(_PRIV_RAW.split())
-    lines = textwrap.wrap(raw_b64, 64)
+    lines   = textwrap.wrap(raw_b64, 64)
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.backends import default_backend
     for header in ("RSA PRIVATE KEY", "PRIVATE KEY"):
@@ -40,18 +47,25 @@ def _load_private_key():
 _PRIVATE_KEY = _load_private_key()
 
 
+# ---------------------------------------------------------------------------
+# Request signing and transport
+# ---------------------------------------------------------------------------
+
 def _signed_headers(method: str, path: str) -> dict:
-    """RSA-sign request: message = timestamp + METHOD + /trade-api/v2/path"""
+    """
+    Kalshi RSA auth.  Signed message = timestamp_ms + METHOD + full_path.
+    A fresh timestamp is generated on every call so retries get new signatures.
+    """
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
-    ts = str(int(time.time() * 1000))
+    ts  = str(int(time.time() * 1000))
     msg = (ts + method.upper() + _API_PREFIX + path).encode()
     sig = _PRIVATE_KEY.sign(msg, padding.PKCS1v15(), hashes.SHA256())
     return {
-        "KALSHI-ACCESS-KEY": _KEY_ID,
+        "KALSHI-ACCESS-KEY":       _KEY_ID,
         "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
         "KALSHI-ACCESS-TIMESTAMP": ts,
-        "Content-Type": "application/json",
+        "Content-Type":            "application/json",
     }
 
 
@@ -59,25 +73,49 @@ def _url(path: str) -> str:
     return _KALSHI_BASE_URL + _API_PREFIX + path
 
 
+def _request(method: str, path: str, *, params=None, json=None, timeout=10) -> dict:
+    """
+    Single HTTP request with up to 3 attempts and exponential backoff.
+    Signing is refreshed on each attempt so the timestamp is always current.
+    """
+    last_exc = None
+    for attempt in range(3):
+        try:
+            r = requests.request(
+                method,
+                _url(path),
+                headers=_signed_headers(method, path),
+                params=params,
+                json=json,
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            return r.json()
+        except requests.HTTPError as e:
+            # 4xx errors are not transient — don't retry
+            if e.response is not None and 400 <= e.response.status_code < 500:
+                raise
+            last_exc = e
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_exc = e
+
+        wait = 2 ** attempt  # 1s, 2s, 4s
+        log.warning(f"Kalshi request failed (attempt {attempt+1}/3): {last_exc}. Retrying in {wait}s")
+        time.sleep(wait)
+
+    raise last_exc
+
+
 def _get(path: str, params: dict = None) -> dict:
-    r = requests.get(_url(path), headers=_signed_headers("GET", path),
-                     params=params, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    return _request("GET", path, params=params)
 
 
 def _post(path: str, body: dict) -> dict:
-    r = requests.post(_url(path), headers=_signed_headers("POST", path),
-                      json=body, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    return _request("POST", path, json=body)
 
 
 def _delete(path: str) -> dict:
-    r = requests.delete(_url(path), headers=_signed_headers("DELETE", path),
-                        timeout=10)
-    r.raise_for_status()
-    return r.json()
+    return _request("DELETE", path)
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +123,7 @@ def _delete(path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def get_balance() -> dict:
-    """Returns {'balance': cents, 'payout': cents, ...}"""
+    """Returns {'balance': cents, ...}"""
     return _get("/portfolio/balance")
 
 
@@ -96,11 +134,10 @@ def get_markets(series_ticker: str = "KXBTCD", status: str = "open") -> list:
 
 
 def search_markets(keyword: str, status: str = "open") -> list:
-    """Fallback: search all open markets for BTC by keyword in title/ticker."""
+    """Fallback: keyword search across all open markets."""
     data = _get("/markets", {"status": status, "limit": 100})
-    all_markets = data.get("markets", [])
-    kw = keyword.lower()
-    return [m for m in all_markets
+    kw   = keyword.lower()
+    return [m for m in data.get("markets", [])
             if kw in m.get("title", "").lower() or kw in m.get("ticker", "").lower()]
 
 
@@ -127,22 +164,37 @@ def place_order(
     price_cents: Optional[int] = None,
 ) -> dict:
     """
-    action: "buy" | "sell"
-    side:   "yes" | "no"
-    type:   "limit" | "market"
-    price_cents: required for limit orders (1-99)
+    action:      "buy" | "sell"
+    side:        "yes" | "no"
+    order_type:  "limit" | "market"
+    price_cents: required for limit orders (1–99)
     """
-    body = {
-        "ticker": ticker,
+    body: dict = {
+        "ticker":          ticker,
         "client_order_id": str(uuid.uuid4()),
-        "action": action,
-        "type": order_type,
-        "side": side,
-        "count": count,
+        "action":          action,
+        "type":            order_type,
+        "side":            side,
+        "count":           count,
     }
     if order_type == "limit" and price_cents is not None:
         body["yes_price" if side == "yes" else "no_price"] = price_cents
     return _post("/orders", body)
+
+
+def close_position(ticker: str, net_position: int) -> Optional[dict]:
+    """
+    Close an open position at market.
+    net_position > 0 → long YES → sell YES
+    net_position < 0 → long NO  → sell NO
+    Returns the order response, or None if nothing to close.
+    """
+    if net_position == 0:
+        return None
+    side  = "yes" if net_position > 0 else "no"
+    count = abs(net_position)
+    log.info(f"Closing position: sell {count} {side} @ market on {ticker}")
+    return place_order(ticker, "sell", side, count, "market")
 
 
 def cancel_order(order_id: str) -> dict:
@@ -150,10 +202,13 @@ def cancel_order(order_id: str) -> dict:
 
 
 def cancel_all_resting() -> list:
+    """Cancel every resting order. Returns list of cancel responses."""
     results = []
     for order in get_orders(status="resting"):
+        oid = order.get("order_id", "")
         try:
-            results.append(cancel_order(order["order_id"]))
-        except Exception:
-            pass
+            results.append(cancel_order(oid))
+            log.info(f"Cancelled order {oid}")
+        except Exception as e:
+            log.error(f"Failed to cancel order {oid}: {e}")
     return results

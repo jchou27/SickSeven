@@ -6,3 +6,5 @@ plotly>=5.20.0
 python-dotenv>=1.0.0
 streamlit-autorefresh>=0.0.1
 cryptography>=42.0.0
+anthropic>=0.40.0
+feedparser>=6.0.0
