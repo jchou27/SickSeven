@@ -270,7 +270,12 @@ def run_cycle(config: dict, state: dict) -> dict:
             log.warning(f"No markets for {series} — falling back to BTC keyword search")
             markets = kc.search_markets("btc")
 
-        market = select_market(markets, signal["direction"])
+        market = select_market(
+            markets,
+            signal["direction"],
+            btc_price=indicators.get("price", 0.0),
+            atr_pct=indicators.get("atr_pct", 0.003),
+        )
         if not market:
             state["errors"].append("No suitable market found")
             return state
@@ -285,6 +290,7 @@ def run_cycle(config: dict, state: dict) -> dict:
             market,
             config["max_contracts"],
             atr_pct=indicators.get("atr_pct", 0.003),
+            btc_price=indicators.get("price", 0.0),
         )
         if not order_params:
             log.info("No order computed (missing price data?)")
@@ -295,18 +301,33 @@ def run_cycle(config: dict, state: dict) -> dict:
         return state
 
     # ── 6. Execute (or dry-run) ───────────────────────────────────────────────
+    # Log Greek warning before placing
+    greeks = order_params.get("greeks") or {}
+    if greeks.get("near_expiry"):
+        log.warning(
+            f"Greek alert: contract near expiry ({greeks.get('hours_to_expiry', '?'):.1f}h) "
+            f"Δ={greeks.get('delta_per_1k', 0):.1f}¢/$1k — sizing capped at 30%"
+        )
+    elif greeks.get("high_gamma"):
+        log.info(
+            f"Greek note: elevated delta Δ={greeks.get('delta_per_1k', 0):.1f}¢/$1k "
+            f"— position scaled by greek_factor={greeks.get('gamma_factor', 1):.2f}"
+        )
+
     order_record = {
-        "timestamp":   now,
-        "signal":      signal["label"],
-        "bull_score":  signal["bull_score"],
-        "ticker":      order_params["ticker"],
-        "side":        order_params["side"],
-        "count":       order_params["count"],
-        "price_cents": order_params["price_cents"],
-        "cost_usd":    order_params["cost_usd"],
-        "rationale":   order_params["rationale"],
-        "dry_run":     config["dry_run"],
-        "result":      None,
+        "timestamp":          now,
+        "signal":             signal["label"],
+        "bull_score":         signal["bull_score"],
+        "ticker":             order_params["ticker"],
+        "side":               order_params["side"],
+        "count":              order_params["count"],
+        "price_cents":        order_params["price_cents"],
+        "cost_usd":           order_params["cost_usd"],
+        "rationale":          order_params["rationale"],
+        "suggested_stop_pct": order_params.get("suggested_stop_pct"),
+        "greeks":             greeks or None,
+        "dry_run":            config["dry_run"],
+        "result":             None,
     }
 
     if config["dry_run"]:

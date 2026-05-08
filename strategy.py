@@ -5,6 +5,8 @@ Imported by trader.py, dashboard.py, monitor.py, and probability_model.py.
 All indicator logic lives here — never duplicate it elsewhere.
 """
 import math
+import re
+from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
@@ -226,23 +228,149 @@ def generate_signal(ind: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Options Greeks (Black-Scholes cash-or-nothing binary)
+# ---------------------------------------------------------------------------
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _parse_strike(market: dict) -> Optional[float]:
+    """Extract BTC strike from Kalshi ticker (T95000 pattern) or title ($95,000)."""
+    m = re.search(r'[Tt](\d{4,7})\b', market.get("ticker", ""))
+    if m:
+        return float(m.group(1))
+    m = re.search(r'\$([0-9,]+)', market.get("title", ""))
+    if m:
+        try:
+            return float(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    return None
+
+
+def _parse_hours_to_expiry(market: dict) -> float:
+    """Hours until market expiry; returns 4.0 when the field is missing."""
+    for key in ("expiration_time", "close_time", "expiry_time"):
+        val = market.get(key)
+        if not val:
+            continue
+        try:
+            if isinstance(val, (int, float)):
+                exp = datetime.fromtimestamp(float(val), tz=timezone.utc)
+            else:
+                exp = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+            hours = (exp - datetime.now(timezone.utc)).total_seconds() / 3600
+            return max(0.1, hours)
+        except Exception:
+            continue
+    return 4.0
+
+
+def compute_greeks(
+    contract_price_cents: float,
+    btc_price: float,
+    strike: float,
+    hours_to_expiry: float,
+    annual_vol: float,
+) -> dict:
+    """
+    Black-Scholes cash-or-nothing binary call Greeks (YES side, risk-free rate = 0).
+
+    Parameters:
+      contract_price_cents — current YES ask in cents (1–99)
+      btc_price            — BTC spot price in USD
+      strike               — option strike price in USD
+      hours_to_expiry      — hours until settlement (> 0)
+      annual_vol           — annualised BTC vol (e.g. 0.80 for 80%)
+
+    Key outputs:
+      delta          — cents per $1 BTC move (sensitivity)
+      gamma          — cents per $1² BTC (rate of delta change)
+      theta_per_hour — cents/hr the contract earns (+ITM) or loses (−OTM) to time decay
+      vega_per_1pct  — cents per +1% annual vol (negative near ATM: vol pushes price to 50¢)
+      delta_per_1k   — practical: cents per $1,000 BTC move
+      high_gamma     — bool: option moves >30¢ per $1k BTC (elevated regime risk)
+      near_expiry    — bool: < 2 hours remaining (gamma spikes, avoid or size down hard)
+      gamma_factor   — 0–1 position-sizing multiplier for compute_order
+    """
+    _empty: dict = dict(
+        delta=0.0, gamma=0.0, theta_per_hour=0.0, vega_per_1pct=0.0,
+        delta_per_1k=0.0, high_gamma=False, near_expiry=True,
+        gamma_factor=0.0, hours_to_expiry=hours_to_expiry,
+    )
+    if hours_to_expiry <= 0 or annual_vol <= 0 or btc_price <= 0 or strike <= 0:
+        return _empty
+
+    T           = max(hours_to_expiry / 8760.0, 1e-7)
+    sigma_sqrtT = annual_vol * math.sqrt(T)
+    if sigma_sqrtT < 1e-8:
+        return {**_empty, "near_expiry": True, "high_gamma": True}
+
+    log_SK = math.log(btc_price / strike)
+    d2     = (log_SK - 0.5 * annual_vol ** 2 * T) / sigma_sqrtT
+    d1     = d2 + sigma_sqrtT
+    phi    = _norm_pdf(d2)
+    S      = btc_price
+
+    # All Greeks scaled to cents (×100 converts [0,1] option value to cents)
+    delta          = phi / (S * sigma_sqrtT) * 100
+    gamma          = -phi * d1 / (S * S * annual_vol ** 2 * T) * 100
+    theta_per_hour = phi * d1 / (2.0 * T) / 8760.0 * 100   # +ITM / −OTM
+    vega_per_1pct  = -phi * d1 / annual_vol * 0.01 * 100
+
+    delta_per_1k = delta * 1000
+    near_expiry  = hours_to_expiry < 2.0
+    high_gamma   = abs(delta_per_1k) > 30.0  # >30¢ per $1k BTC move = elevated risk
+
+    # Sizing multiplier: reference 15¢/$1k = typical 4-hour near-ATM binary
+    gamma_factor = min(1.0, 15.0 / max(abs(delta_per_1k), 0.5))
+    if near_expiry:
+        gamma_factor = min(gamma_factor, 0.3)  # hard cap at 30% size near expiry
+
+    return {
+        "delta":           round(delta, 5),
+        "gamma":           round(gamma, 8),
+        "theta_per_hour":  round(theta_per_hour, 4),
+        "vega_per_1pct":   round(vega_per_1pct, 4),
+        "delta_per_1k":    round(delta_per_1k, 3),
+        "high_gamma":      high_gamma,
+        "near_expiry":     near_expiry,
+        "gamma_factor":    round(gamma_factor, 3),
+        "hours_to_expiry": round(hours_to_expiry, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Market selection
 # ---------------------------------------------------------------------------
 
-def select_market(markets: list, direction: str) -> Optional[dict]:
+def select_market(
+    markets: list,
+    direction: str,
+    btc_price: float = 0.0,
+    atr_pct: float = 0.003,
+) -> Optional[dict]:
     """
     Pick the best Kalshi BTC market for the given direction.
 
-    Scoring criteria (in priority order):
-    1. Relevant-side ask must be 15–85 cents (not near-certain; maximum edge range)
-    2. Prefer markets closest to 50 cents (maximum uncertainty = maximum edge value)
+    Scoring criteria:
+    1. Relevant-side ask must be 15–85 cents (maximum edge range)
+    2. Prefer markets closest to 50 cents (maximum uncertainty = maximum edge)
     3. Among similar odds, prefer highest volume (tightest spread, easiest exit)
+    4. When btc_price is provided, apply Greek-based gamma_factor to down-weight
+       contracts near expiry or with high delta sensitivity.
 
-    Uses log(1 + volume) to prevent a single high-volume market from completely
-    dominating markets with reasonable odds and moderate volume.
+    The selected market dict will have a '_greeks' key when Greeks are available.
     """
     if not markets:
         return None
+
+    annual_vol = atr_pct * math.sqrt(8760)
 
     scored = []
     for m in markets:
@@ -254,15 +382,26 @@ def select_market(markets: list, direction: str) -> Optional[dict]:
 
         target = yes_ask if direction == "up" else no_ask
         if 15 <= target <= 85:
-            proximity = 1.0 - abs(target - 50) / 50.0   # 0→edge, 1→fair
-            vol_score = math.log1p(volume)
-            scored.append((proximity * 0.6 + vol_score * 0.4, m))
+            proximity    = 1.0 - abs(target - 50) / 50.0
+            vol_score    = math.log1p(volume)
+            greek_factor = 1.0
+            greeks: Optional[dict] = None
+
+            if btc_price > 0:
+                strike = _parse_strike(m)
+                hours  = _parse_hours_to_expiry(m)
+                if strike:
+                    greeks       = compute_greeks(target, btc_price, strike, hours, annual_vol)
+                    greek_factor = greeks["gamma_factor"]
+
+            score  = (proximity * 0.6 + vol_score * 0.4) * greek_factor
+            m_copy = dict(m, _greeks=greeks) if greeks else m
+            scored.append((score, m_copy))
 
     if scored:
         scored.sort(key=lambda x: x[0], reverse=True)
         return scored[0][1]
 
-    # Relax: any market, highest volume
     return max(markets, key=lambda m: m.get("volume") or 0)
 
 
@@ -275,16 +414,20 @@ def compute_order(
     market: dict,
     max_contracts: int,
     atr_pct: float = 0.003,
+    btc_price: float = 0.0,
 ) -> Optional[dict]:
     """
     Convert signal + market into order parameters.
     Returns None when no trade should be placed (HOLD or missing price).
 
-    Position sizing:
-    - Base: max_contracts × signal.strength  (1.0 for strong, 0.5 for regular)
-    - Volatility adjustment: scale down when BTC is unusually volatile.
-      Reference volatility = 0.3% per hour.  At 2× vol, halve the position.
-      This ensures roughly constant dollar-risk per trade across vol regimes.
+    Position sizing (three multipliers, all ≤ 1.0):
+    - Signal strength: 1.0 for STRONG, 0.5 for regular BUY/SELL
+    - Volatility factor: scales down when BTC vol exceeds the 0.3%/hr reference
+    - Greek factor: scales down when delta/gamma is elevated (near expiry or ATM
+      with little time left). Caps at 0.3 when < 2 hours to expiry.
+
+    Greeks are sourced from the market dict's '_greeks' key (set by select_market)
+    or computed fresh when btc_price is provided.
     """
     if signal["direction"] == "neutral" or signal["strength"] == 0:
         return None
@@ -294,29 +437,56 @@ def compute_order(
     if ask is None:
         return None
 
-    # Volatility-adjusted count
-    base_vol    = 0.003
-    vol_factor  = min(1.0, base_vol / max(atr_pct, base_vol * 0.1))
-    raw_count   = max_contracts * signal["strength"] * vol_factor
-    count       = max(1, round(raw_count))
+    # Volatility-adjusted factor
+    base_vol   = 0.003
+    vol_factor = min(1.0, base_vol / max(atr_pct, base_vol * 0.1))
+
+    # Greek-adjusted factor — use pre-computed Greeks from select_market if present
+    greeks = market.get("_greeks")
+    if greeks is None and btc_price > 0:
+        strike = _parse_strike(market)
+        hours  = _parse_hours_to_expiry(market)
+        if strike:
+            annual_vol = atr_pct * math.sqrt(8760)
+            greeks     = compute_greeks(ask, btc_price, strike, hours, annual_vol)
+
+    greek_factor = greeks["gamma_factor"] if greeks else 1.0
+
+    raw_count = max_contracts * signal["strength"] * vol_factor * greek_factor
+    count     = max(1, round(raw_count))
+
+    # Tighten stop-loss recommendation when near expiry
+    suggested_stop_pct: Optional[float] = None
+    if greeks and greeks.get("near_expiry"):
+        suggested_stop_pct = 0.20
 
     # Limit 1 cent above ask — quick fill without chasing the book
     limit_price = min(99, max(1, ask + 1))
     cost_usd    = round(count * limit_price / 100, 2)
 
+    greek_note = ""
+    if greeks:
+        greek_note = (
+            f" | Δ={greeks['delta_per_1k']:.1f}¢/$1k"
+            + (" [near-expiry]" if greeks["near_expiry"] else "")
+        )
+
     return {
-        "ticker":      market["ticker"],
-        "action":      "buy",
-        "side":        side,
-        "count":       count,
-        "order_type":  "limit",
-        "price_cents": limit_price,
-        "cost_usd":    cost_usd,
-        "rationale":   (
+        "ticker":             market["ticker"],
+        "action":             "buy",
+        "side":               side,
+        "count":              count,
+        "order_type":         "limit",
+        "price_cents":        limit_price,
+        "cost_usd":           cost_usd,
+        "suggested_stop_pct": suggested_stop_pct,
+        "greeks":             greeks,
+        "rationale": (
             f"{signal['label']} | RSI={signal['rsi']:.1f} "
-            f"MACD={'▲' if signal['macd'] > signal['macd_hist'] + signal['macd'] else '▼'} "
+            f"MACD={'▲' if signal.get('macd_hist', 0) > 0 else '▼'} "
             f"score={signal['bull_score']:+d} | "
-            f"vol_adj={vol_factor:.2f} → {count} contracts @ {limit_price}¢"
+            f"vol={vol_factor:.2f} greek={greek_factor:.2f} → "
+            f"{count}×@ {limit_price}¢{greek_note}"
         ),
     }
 
