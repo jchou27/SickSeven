@@ -132,9 +132,32 @@ def fetch_kraken_ohlcv(interval: str = "5m", limit: int = 200) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=10)
+def fetch_composite_price() -> dict:
+    """
+    BRTI-approximate price from four constituent exchanges in parallel.
+    Falls back to Kraken-only if the composite feed fails entirely.
+    """
+    try:
+        from price_feed import get_composite_price
+        return get_composite_price()
+    except Exception:
+        pass
+    # Kraken-only fallback
+    try:
+        r = requests.get(f"{KRAKEN_BASE}/Ticker?pair=XBTUSD", timeout=8)
+        r.raise_for_status()
+        result = r.json()["result"]
+        t = result[next(iter(result))]
+        price = (float(t["a"][0]) + float(t["b"][0])) / 2
+        return {"price": price, "sources": {"kraken": price}, "source_count": 1, "spread_pct": 0.0}
+    except Exception:
+        return {"price": 0.0, "sources": {}, "source_count": 0, "spread_pct": 0.0}
+
+
 @st.cache_data(ttl=30)
 def fetch_btc_ticker() -> dict:
-    """Current BTC price and 24h stats from Kraken."""
+    """24h stats from Kraken (high, low, volume, change %)."""
     try:
         r = requests.get(f"{KRAKEN_BASE}/Ticker?pair=XBTUSD", timeout=8)
         r.raise_for_status()
@@ -445,6 +468,7 @@ with col_tf:
 # Fetch all data
 with st.spinner(""):
     df_ohlcv      = fetch_kraken_ohlcv(tf, limit=200)
+    composite     = fetch_composite_price()
     ticker        = fetch_btc_ticker()
     kalshi_mkts   = fetch_kalshi_markets()
     fng           = fetch_fear_greed()
@@ -478,7 +502,11 @@ llm_color = SIGNAL_COLORS.get(llm_label, "#FFD600")
 # ---------------------------------------------------------------------------
 
 m1, m2, m3, m4, m5, m6 = st.columns(6)
-m1.metric("BTC Price",   f"${ticker['price']:,.2f}",    f"{ticker['change_pct']:+.2f}%")
+_src_count  = composite.get("source_count", 0)
+_spread     = composite.get("spread_pct", 0.0)
+_src_label  = f"{_src_count}/4 exchanges  spread {_spread:.3f}%"
+m1.metric("BRTI ≈ Price", f"${composite['price']:,.2f}",
+          f"{ticker['change_pct']:+.2f}%  ({_src_label})")
 m2.metric("24h High",    f"${ticker['high_24h']:,.0f}")
 m3.metric("24h Low",     f"${ticker['low_24h']:,.0f}")
 m4.metric(f"RSI ({tf})", f"{ind['rsi']:.1f}",

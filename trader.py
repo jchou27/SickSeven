@@ -184,7 +184,20 @@ def run_cycle(config: dict, state: dict) -> dict:
         indicators = compute_indicators(prices)
         signal     = generate_signal(indicators)
 
-        state["current_price"]      = indicators["price"]
+        # Overlay composite BRTI-approximate price for display and Greeks.
+        # The 30-day hourly series from CoinGecko drives the signal; the
+        # composite gives a fresher price for risk management calculations.
+        try:
+            from price_feed import get_composite_price
+            _cp = get_composite_price()
+            live_price = _cp["price"]
+            state["price_feed"] = _cp
+        except Exception as _pf_err:
+            log.debug(f"Composite price feed failed, using CoinGecko last: {_pf_err}")
+            live_price = indicators["price"]
+            state["price_feed"] = None
+
+        state["current_price"]      = live_price
         state["current_indicators"] = indicators
 
         prev_label = state.get("last_signal")
@@ -273,7 +286,7 @@ def run_cycle(config: dict, state: dict) -> dict:
         market = select_market(
             markets,
             signal["direction"],
-            btc_price=indicators.get("price", 0.0),
+            btc_price=live_price,
             atr_pct=indicators.get("atr_pct", 0.003),
         )
         if not market:
@@ -290,7 +303,7 @@ def run_cycle(config: dict, state: dict) -> dict:
             market,
             config["max_contracts"],
             atr_pct=indicators.get("atr_pct", 0.003),
-            btc_price=indicators.get("price", 0.0),
+            btc_price=live_price,
         )
         if not order_params:
             log.info("No order computed (missing price data?)")
