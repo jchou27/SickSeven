@@ -1,8 +1,8 @@
 # SickSeven — BTC / Kalshi Automated Trading System
 
 A real-time Bitcoin analysis and autonomous trading engine. Generates directional
-signals from technical indicators, an LLM probability model, and live news, then
-executes binary-option orders on Kalshi.
+signals from technical indicators, an LLM probability model, live news, and Trump
+tweet monitoring, then executes binary-option orders on Kalshi.
 
 ---
 
@@ -15,13 +15,19 @@ places Kalshi binary-option orders when there is a clear directional edge.
 
 **Short-term monitor (1m / 5m / 15m)**
 A separate Streamlit dashboard with live Kraken candlestick charts, short-term
-indicators (VWAP, fast/slow EMA cross), and a real-time signal badge. Refreshes
-every 15 seconds.
+indicators (VWAP, fast/slow EMA cross), a real-time signal badge, and a Trump
+signal card. Refreshes every 15 seconds.
 
 **LLM probability model**
 Uses the Claude API (claude-sonnet-4-6) to blend the technical signal with live BTC
-news headlines, Fear & Greed Index, and BTC dominance into a 0–100% probability
-estimate. Displayed as a gauge on the short-term monitor.
+news headlines, Fear & Greed Index, BTC dominance, and any recent Trump tweet signal
+into a 0–100% probability estimate. Displayed as a gauge on the short-term monitor.
+
+**Trump tweet watcher**
+Polls Trump's Truth Social and Twitter/X feeds every 30 seconds around the clock.
+Every new tweet is classified by Claude Haiku into a market impact category
+(BTC bullish / BTC bearish / USD bearish / USD bullish / neutral) and a probability
+adjustment (±0–25%). The signal feeds directly into the probability model.
 
 ---
 
@@ -35,7 +41,8 @@ sickseven/
 ├── strategy.py             # All indicator + signal + sizing logic (long + short term)
 ├── kalshi_client.py        # Kalshi API v2 wrapper (RSA auth + retry)
 ├── news_fetcher.py         # BTC news aggregator (8 RSS feeds + 3 Reddit, no keys)
-├── probability_model.py    # LLM probability model (Claude API)
+├── probability_model.py    # LLM probability model (Claude API + Trump signal)
+├── trump_watcher.py        # 24/7 Trump tweet monitor and classifier
 │
 ├── trader.py               # Autonomous trading daemon
 ├── dashboard.py            # Long-term trading control UI (port 8501)
@@ -43,6 +50,8 @@ sickseven/
 │
 ├── trading_config.json     # Runtime config (auto-created on first run)
 ├── trading_state.json      # Live state written by daemon, read by dashboards
+├── trump_state.json        # Latest Trump tweet + classification (written by watcher)
+├── trump_watcher.log       # Log of every detected tweet and its classification
 └── trader.log              # Rolling log of every trader cycle
 ```
 
@@ -58,7 +67,7 @@ Holds all secrets. Never share or commit this file.
 | `GECKO_API` | CoinGecko demo API key for 30-day hourly price history |
 | `KALSHI_API_KEY` | Your Kalshi key UUID (identifies who you are) |
 | `KALSHI_PRIV` | RSA private key used to sign every Kalshi request |
-| `ANTHROPIC_API_KEY` | Claude API key for the LLM probability model |
+| `ANTHROPIC_API_KEY` | Claude API key — used by both the probability model and the tweet classifier |
 
 Kalshi uses RSA signature authentication — every API request is signed with
 your private key, not a simple bearer token.
@@ -81,8 +90,8 @@ Everything else imports from here; never duplicate indicator logic in other file
 
 Score → signal: ≥4 = STRONG BUY, 2–3 = BUY, -1–1 = HOLD, -2–-3 = SELL, ≤-4 = STRONG SELL
 
-**Short-term signal (1m / 5m / 15m):** Same RSI and MACD factors, but replaces the
-SMA/EMA200 trend filters with a fast/slow EMA cross (±1) and VWAP comparison (±1).
+**Short-term signal (1m / 5m / 15m):** Same RSI and MACD factors, but replaces
+SMA/EMA200 filters with a fast/slow EMA cross (±1) and VWAP comparison (±1).
 Indicator periods adapt to the selected timeframe.
 
 **Position sizing:** ATR-based volatility scaling. At 2× normal volatility, position
@@ -110,13 +119,36 @@ sorted newest-first with age in minutes.
 
 ---
 
+### `trump_watcher.py`
+Polls Trump's Truth Social (primary) and Nitter/Twitter instances (fallback) every
+30 seconds. On a new tweet, calls **Claude Haiku** to classify market impact:
+
+| Classification | Meaning | Probability adjustment |
+|---|---|---|
+| `btc_bullish` | Direct crypto support, strategic reserve, deregulation | +0.05 to +0.25 |
+| `usd_bearish` | Tariff inflation, Fed rate cut pressure, dollar weakness | +0.05 to +0.20 |
+| `btc_bearish` | Anti-crypto statements, regulation threats | -0.05 to -0.25 |
+| `usd_bullish` | Strong dollar stance, fiscal tightening | -0.05 to -0.20 |
+| `neutral` | Sports, personal attacks, unrelated content | 0.00 |
+
+Haiku is used here (not Sonnet) because this task runs 24/7 at 30-second intervals —
+it is roughly 12× cheaper and fast enough for simple classification.
+
+The result is written to `trump_state.json`. The probability model reads this file
+automatically. The watcher is **optional** — everything else works without it.
+
+---
+
 ### `probability_model.py`
 Calls the Claude API to estimate the probability BTC moves up over the next ~4 hours.
-Inputs: current technical indicators, live news headlines, Fear & Greed Index,
-BTC dominance, and total crypto market cap change.
 
-The final probability is a 50/50 blend of the technical score and the LLM estimate.
-Falls back to technical-only if the Claude API is unavailable.
+Signal pipeline:
+1. Technical score → raw probability (10%–90%)
+2. Claude Sonnet-4-6 LLM call → contextual estimate from news + macro
+3. 50/50 blend of technical and LLM
+4. Trump tweet adjustment applied on top (additive, clamped to 5%–95%)
+
+Falls back gracefully at each step if any data source is unavailable.
 
 ---
 
@@ -154,8 +186,8 @@ Short-term market monitor. Auto-refreshes every 15 seconds.
 - Short-term technical signal badge (BUY / SELL / HOLD + score)
 - LLM probability gauge (Claude API estimate, refreshes every 5 minutes)
 - Live BTC news feed (last 3 hours, up to 20 headlines)
-- Fear & Greed Index + BTC dominance snapshot
-- Kalshi market odds
+- Trump signal card — shows latest tweet impact, urgency, and probability adjustment
+- Fear & Greed Index + trader daemon status
 
 ---
 
@@ -193,6 +225,44 @@ streamlit run monitor.py --server.port 8502
 ```
 Open `http://localhost:8502`
 
+**6. Start the Trump tweet watcher** (terminal 4, optional)
+```
+python trump_watcher.py
+```
+Runs silently in the background. Writes to `trump_state.json` and `trump_watcher.log`.
+The probability model and monitor pick up its output automatically — no restart needed.
+
+---
+
+## Position Sizing
+
+The three config fields that control how much money is at risk:
+
+**`max_contracts`** — how many contracts per single trade. At ~50 cents per contract
+on average, `max_contracts=2` costs about $1 per trade.
+
+**`max_open_risk_usd`** — the hard cap on total open exposure across all positions
+simultaneously. The daemon will not place new orders once this is reached. This is
+your primary bankroll protection.
+
+**`stop_loss_pct`** — exits a position early when its unrealised loss exceeds this
+percentage of what you paid. At 0.35, a $1.00 position is cut when it falls to $0.65.
+
+### Recommended settings by bankroll
+
+| Bankroll | max_contracts | max_open_risk_usd | stop_loss_pct | cooldown_minutes |
+|---|---|---|---|---|
+| < $50    | 1             | $3                | 0.30          | 30               |
+| $200     | 3             | $20               | 0.35          | 30               |
+| $500     | 5             | $50               | 0.40          | 15               |
+| $1,000+  | 8             | $100              | 0.40          | 15               |
+
+The rule of thumb: `max_open_risk_usd` should be 10% of your total bankroll. Even a
+complete wipeout of all open positions costs you at most 10%, and you keep trading.
+
+The defaults in the codebase (`max_contracts=2`, `max_open_risk_usd=5.0`) are set for
+minimal liquidity. Adjust them in the dashboard config form as your account grows.
+
 ---
 
 ## Going Live
@@ -204,7 +274,7 @@ When ready:
 1. Open `http://localhost:8501`
 2. Scroll to **Trading Configuration**
 3. Uncheck **Dry Run** → check **Enable live trading**
-4. Set your **Max contracts** and **Max open risk (USD)** conservatively
+4. Set `max_contracts` and `max_open_risk_usd` for your bankroll (see table above)
 5. Click **Save Configuration**
 
 The daemon picks up the change within 60 seconds.
@@ -234,6 +304,6 @@ The market selector targets contracts where the relevant side is priced 15–85 
 - This system places real financial bets on Kalshi using your account funds.
 - Past indicator signals do not guarantee future performance.
 - Kalshi binary options can expire worthless — you can lose 100% of what you bet.
-- Start with `max_contracts: 1` and `max_open_risk_usd: 10` until you have validated
-  the strategy over multiple live cycles.
+- Start in dry-run mode and validate the system over multiple cycles before going live.
 - Always monitor `trader.log` when live trading is active.
+- Never set `max_open_risk_usd` above 15% of your total available capital.
